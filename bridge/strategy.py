@@ -18,6 +18,7 @@ log = logging.getLogger("strategy")
 
 client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
+
 # strategies[sid] = {
 #   "code":       str,    # def check(v): ...
 #   "action":     str,    # "BUY" or "SELL"
@@ -37,6 +38,7 @@ You are a trading strategy parser. Convert a natural language trading instructio
 OUTPUT FORMAT (return only valid JSON, no explanation, no markdown fences):
 {
   "action": "BUY or SELL or BOTH",
+  "tf": 60,
   "lot": 0.1,
   "sl_pip": 50,
   "tp_pip": 100,
@@ -50,6 +52,7 @@ OUTPUT FORMAT (return only valid JSON, no explanation, no markdown fences):
 }
 
 RULES:
+- tf: timeframe in minutes extracted from prompt — 1=M1 5=M5 15=M15 30=M30 60=H1 240=H4 1440=D1 10080=W1; if not mentioned set tf=0
 - ohlc_bars: minimum bars needed (engulfing=2, morning star=3, breakout 20=21, default=3)
 - indicators: only list what check(v) actually uses; add _prev variants for crossover detection
 - code: must be def check(v: dict) -> bool: with return bool
@@ -76,6 +79,7 @@ def handle_init(sid: int, data: dict) -> dict:
     if not prompt:
         return {"status": "error", "message": "Empty prompt"}
 
+
     log.info(f"[S{sid}] {symbol}: Parsing '{prompt[:60]}...'")
 
     # Call Claude API
@@ -88,7 +92,7 @@ def handle_init(sid: int, data: dict) -> dict:
                 "role": "user",
                 "content": (
                     f'Instruction: "{prompt}"\n'
-                    f'Symbol: {symbol}, Timeframe: {tf} minutes\n'
+                    f'Symbol: {symbol}\n'
                     f'Default lot: {lot}, SL: {sl} pips, TP: {tp} pips'
                 )
             }]
@@ -137,12 +141,22 @@ def handle_init(sid: int, data: dict) -> dict:
         log.warning(f"[S{sid}] Dry-run failed: {err}")
         return {"status": "error", "message": f"Code dry-run failed: {err}"}
 
+    # TF: ưu tiên Claude extract từ prompt, fallback về giá trị mặc định từ EA
+    tf_from_claude = int(config.get("tf", 0))
+    if tf_from_claude > 0:
+        tf = tf_from_claude
+        log.info(f"[S{sid}] TF từ prompt (Claude): {tf} phút")
+    else:
+        log.info(f"[S{sid}] TF không có trong prompt, dùng mặc định: {tf} phút")
+    config["tf"] = tf
+
     # Store strategy
     strategies[sid] = config
-    log.info(f"[S{sid}] Loaded OK. Indicators: {[i['name'] for i in config.get('indicators', [])]}")
+    log.info(f"[S{sid}] Loaded OK. TF={tf} Indicators: {[i['name'] for i in config.get('indicators', [])]}")
 
     return {
         "status":     "ok",
+        "tf":         tf,
         "indicators": config.get("indicators", []),
         "ohlc_bars":  config["ohlc_bars"],
     }

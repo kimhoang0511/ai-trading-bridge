@@ -1,14 +1,32 @@
 import os
+import sys
 
 # ── Anthropic API ─────────────────────────────────────────────────────────────
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")   # set via env var
+HARDCODED_KEY = "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"  # paste your key here: "sk-ant-api03-..."
+
+def _load_api_key() -> str:
+    # 1. Hardcoded in config.py
+    if HARDCODED_KEY:
+        return HARDCODED_KEY
+    # 2. Environment variable
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if key:
+        return key
+    # 3. api_key.txt next to the exe (or script directory)
+    base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
+    key_file = os.path.join(base, "api_key.txt")
+    if os.path.isfile(key_file):
+        with open(key_file, encoding="utf-8") as f:
+            key = f.read().strip()
+    return key
+
+ANTHROPIC_API_KEY = _load_api_key()
 ANTHROPIC_MODEL   = "claude-sonnet-4-6"
 MAX_TOKENS        = 1000
 
-# ── Named Pipe ────────────────────────────────────────────────────────────────
-PIPE_EA_TO_BRIDGE = r"\\.\pipe\ea_to_bridge"
-PIPE_BRIDGE_TO_EA = r"\\.\pipe\bridge_to_ea"
-PIPE_BUFFER_SIZE  = 65536   # 64KB
+# ── HTTP Server ───────────────────────────────────────────────────────────────
+HTTP_HOST = "0.0.0.0"
+HTTP_PORT = 8080
 
 # ── Strategy limits ───────────────────────────────────────────────────────────
 MAX_STRATEGIES    = 5       # must match EA extern params count

@@ -1,0 +1,12 @@
+LIBRARY AI_Bridge
+EXPORTS
+    Bridge_Init       @1
+    Bridge_Check      @2
+    Bridge_Stop       @3
+    Bridge_Version    @4
+    Bridge_GetLastLog @5
+    Bridge_Register     @6
+    Bridge_WsConnect    @7
+    Bridge_WsPoll       @8
+    Bridge_WsDisconnect @9
+    Bridge_WsGetStatus  @10

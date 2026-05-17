@@ -1,0 +1,7 @@
+// resources.rc — embed all runtime files inside AI_Bridge.dll
+// Build: rc.exe resources.rc  →  resources.res
+
+BRIDGE_PYD  RCDATA  "build\\bridge_entry.pyd"
+EXT_PKGS    RCDATA  "build\\ext_packages.zip"
+PYTHON_DLL  RCDATA  "python312.dll"
+PYTHON_ZIP  RCDATA  "python312.zip"

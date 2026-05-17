@@ -28,9 +28,9 @@ def check_requirements():
     if sys.version_info < (3, 10):
         errors.append(f"Python 3.10+ required (found {sys.version})")
 
-    # Windows check
+    # MT4 runs on Windows — warn but don't block (bridge itself runs anywhere)
     if sys.platform != "win32":
-        errors.append("Named Pipe requires Windows")
+        errors.append("MT4 requires Windows. The bridge can run on Windows only.")
 
     # API key
     from config import ANTHROPIC_API_KEY
@@ -41,11 +41,7 @@ def check_requirements():
             "  Option 2: edit bridge/config.py and set ANTHROPIC_API_KEY"
         )
 
-    # pywin32
-    try:
-        import win32pipe
-    except ImportError:
-        errors.append("pywin32 not installed: pip install pywin32")
+    # anthropic (checked below)
 
     # anthropic
     try:
@@ -83,12 +79,13 @@ def main():
     _get_base_sandbox()
     log.info("PA Helpers loaded OK")
 
-    # Start pipe server (blocks forever)
     from bridge import run as run_bridge
+    from config import MAX_STRATEGIES, HTTP_HOST, HTTP_PORT
 
-    from config import MAX_STRATEGIES
     log.info(f"Max simultaneous strategies: {MAX_STRATEGIES}")
-    log.info("Bridge ready. Start MT4 and attach AI_EA to a chart.")
+    log.info(f"HTTP Bridge: http://{HTTP_HOST}:{HTTP_PORT}")
+    log.info(f"Add to MT4 whitelist: Tools → Options → Expert Advisors → Allow WebRequest → http://{HTTP_HOST}:{HTTP_PORT}")
+    log.info("Start MT4 and attach AI_EA to a chart.")
     log.info("Press Ctrl+C to stop.\n")
 
     try:
