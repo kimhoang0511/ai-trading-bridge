@@ -271,6 +271,12 @@ struct V {
     double C(int i=0)   const { return get("close_" +std::to_string(i)); }
     double Vol(int i=0) const { return get("volume_"+std::to_string(i)); }
     double point()      const { return get("point",0.00001); }
+    // Returns how many OHLCV bars are actually present in the value map.
+    int avail_bars()    const {
+        int n=0;
+        while(d.count("high_"+std::to_string(n))) n++;
+        return n;
+    }
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -363,15 +369,19 @@ static bool is_three_inside_down(const V& v){ return is_bull_harami(v)&&is_bear(
 
 // Market structure
 static bool is_higher_high(const V& v,int n=3){
+    int ab=v.avail_bars(); if(ab<2)return false; if(n>ab)n=ab;
     for(int i=0;i<n-1;i++) if(v.H(i)<=v.H(i+1)) return false; return true;
 }
 static bool is_lower_low(const V& v,int n=3){
+    int ab=v.avail_bars(); if(ab<2)return false; if(n>ab)n=ab;
     for(int i=0;i<n-1;i++) if(v.L(i)>=v.L(i+1)) return false; return true;
 }
 static bool is_higher_low(const V& v,int n=3){
+    int ab=v.avail_bars(); if(ab<2)return false; if(n>ab)n=ab;
     for(int i=0;i<n-1;i++) if(v.L(i)<=v.L(i+1)) return false; return true;
 }
 static bool is_lower_high(const V& v,int n=3){
+    int ab=v.avail_bars(); if(ab<2)return false; if(n>ab)n=ab;
     for(int i=0;i<n-1;i++) if(v.H(i)>=v.H(i+1)) return false; return true;
 }
 static bool is_uptrend(const V& v,int n=4){
@@ -381,29 +391,36 @@ static bool is_downtrend(const V& v,int n=4){
     int h=std::max(n/2,2); return is_lower_high(v,h)&&is_lower_low(v,h);
 }
 static bool is_consolidating(const V& v,int n=5){
-    double hi=v.H(0),lo=v.L(0),ab=0;
-    for(int i=0;i<n;i++){hi=std::max(hi,v.H(i));lo=std::min(lo,v.L(i));ab+=body(v,i);}
-    ab/=n; return ab>0 && (hi-lo)<ab*n*0.5;
+    int ab=v.avail_bars(); if(ab<1)return false; if(n>ab)n=ab;
+    double hi=v.H(0),lo=v.L(0),ab_body=0;
+    for(int i=0;i<n;i++){hi=std::max(hi,v.H(i));lo=std::min(lo,v.L(i));ab_body+=body(v,i);}
+    ab_body/=n; return ab_body>0 && (hi-lo)<ab_body*n*0.5;
 }
 static bool is_bull_breakout(const V& v,int n=20){
+    // lookback uses bars 1..n; bar 0 is current close
+    int avail=v.avail_bars()-1; if(avail<1)return false; if(n>avail)n=avail;
     double hi=v.H(1);
     for(int i=1;i<=n;i++) hi=std::max(hi,v.H(i));
     return v.C(0)>hi && is_bull(v,0);
 }
 static bool is_bear_breakout(const V& v,int n=20){
+    int avail=v.avail_bars()-1; if(avail<1)return false; if(n>avail)n=avail;
     double lo=v.L(1);
     for(int i=1;i<=n;i++) lo=std::min(lo,v.L(i));
     return v.C(0)<lo && is_bear(v,0);
 }
 static bool is_high_volume(const V& v,int n=5,double mult=1.5){
-    if(n<1)return false;
+    int avail=v.avail_bars()-1; if(avail<1)return false; if(n>avail)n=avail;
     double avg=0; for(int i=1;i<=n;i++) avg+=v.Vol(i); avg/=n;
     return avg>0 && v.Vol(0)>avg*mult;
 }
 static bool is_accelerating_up(const V& v,int n=3){
+    // needs C(0)..C(n): total n+1 bars
+    int avail=v.avail_bars()-1; if(avail<1)return false; if(n>avail)n=avail;
     for(int i=0;i<n;i++) if(v.C(i)<=v.C(i+1)) return false; return true;
 }
 static bool is_accelerating_down(const V& v,int n=3){
+    int avail=v.avail_bars()-1; if(avail<1)return false; if(n>avail)n=avail;
     for(int i=0;i<n;i++) if(v.C(i)>=v.C(i+1)) return false; return true;
 }
 static bool near_round_number(const V& v,int pip_range=10){
@@ -413,30 +430,55 @@ static bool near_round_number(const V& v,int pip_range=10){
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// §7b  SEQ state  (forward-declared here so EvalCond can use it)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+struct SeqState {
+    bool   active      = false;
+    double bar_time    = 0;
+    int    bars_waited = 0;
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // §8  Condition evaluator  (maps to sandbox_run in Python)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 static double GetVal(const JVal& node, const V& vals) {
     if(node.isNum()) return node.n;
     if(node.isStr()) return vals.get(node.s);
+    // EXPR node — arithmetic on indicator values or literals
+    // {"type":"EXPR","op":"+|-|*|/|abs","left":{...},"right":{...}}
+    if(node.str("type") == "EXPR") {
+        std::string op = node.str("op");
+        auto* lp = node.get("left");
+        double lv = lp ? GetVal(*lp, vals) : 0.0;
+        if(op == "abs") return std::abs(lv);            // unary
+        auto* rp = node.get("right");
+        double rv = rp ? GetVal(*rp, vals) : 0.0;
+        if(op == "+") return lv + rv;
+        if(op == "-") return lv - rv;
+        if(op == "*") return lv * rv;
+        if(op == "/") return rv != 0.0 ? lv / rv : 0.0;
+        Log("Unknown EXPR op: " + op);
+    }
     return 0.0;
 }
 
-static bool EvalCond(const JVal& node, const V& vals) {
+static bool EvalCond(const JVal& node, const V& vals, SeqState* seq = nullptr) {
     std::string type=node.str("type");
 
     if(type=="AND"){
         auto* args=node.get("args"); if(!args||!args->isArr()) return false;
-        for(auto& a:args->a) if(!EvalCond(a,vals)) return false;
+        for(auto& a:args->a) if(!EvalCond(a,vals,seq)) return false;
         return true;
     }
     if(type=="OR"){
         auto* args=node.get("args"); if(!args||!args->isArr()) return false;
-        for(auto& a:args->a) if(EvalCond(a,vals)) return true;
+        for(auto& a:args->a) if(EvalCond(a,vals,seq)) return true;
         return false;
     }
     if(type=="NOT"){
-        auto* arg=node.get("arg"); return arg ? !EvalCond(*arg,vals) : false;
+        auto* arg=node.get("arg"); return arg ? !EvalCond(*arg,vals,seq) : false;
     }
     if(type=="CMP"){
         auto* lp=node.get("left"); auto* rp=node.get("right");
@@ -448,6 +490,53 @@ static bool EvalCond(const JVal& node, const V& vals) {
         if(op=="==")return std::abs(lv-rv)<1e-9;
         if(op=="!=")return std::abs(lv-rv)>=1e-9;
         return false;
+    }
+    // TIME node — broker server time filter (uses "time" from vals)
+    // {"type":"TIME","from":900,"to":1700}  (HHMM integer, 24h)
+    if(type=="TIME"){
+        int from = node.inum("from", 0);
+        int to   = node.inum("to",   2400);
+        long ts  = (long)vals.get("time");
+        int hhmm = ((ts / 3600) % 24) * 100 + (ts / 60) % 60;
+        return (from <= to) ? (hhmm >= from && hhmm < to)
+                            : (hhmm >= from || hhmm < to); // crosses midnight
+    }
+    // SEQ node — 2-step sequencer: step1 fires, then step2 must fire on a later bar
+    // {"type":"SEQ","step1":{...},"step2":{...},"bars":3}
+    // bars = max bars to wait for step2 (default 3, 0 = unlimited)
+    if(type=="SEQ"){
+        if(!seq) return false;
+        auto* s1 = node.get("step1");
+        auto* s2 = node.get("step2");
+        if(!s1 || !s2) return false;
+        int  max_bars  = node.inum("bars", 3);
+        double cur_bar = vals.get("bar_time");
+
+        if(!seq->active) {
+            if(EvalCond(*s1, vals, seq)) {
+                seq->active      = true;
+                seq->bar_time    = cur_bar;
+                seq->bars_waited = 0;
+                Log("SEQ step1 triggered — waiting for step2");
+            }
+            return false;
+        } else {
+            // step1 already triggered — wait for new bar
+            if(cur_bar > seq->bar_time) {
+                seq->bar_time = cur_bar;
+                seq->bars_waited++;
+                if(EvalCond(*s2, vals, seq)) {
+                    seq->active = false;
+                    Log("SEQ step2 confirmed — SIGNAL");
+                    return true;
+                }
+                if(max_bars > 0 && seq->bars_waited >= max_bars) {
+                    Log("SEQ expired after " + std::to_string(seq->bars_waited) + " bars — reset");
+                    seq->active = false;
+                }
+            }
+            return false;
+        }
     }
     if(type=="FN"){
         std::string name=node.str("name");
@@ -548,15 +637,19 @@ INDICATOR TYPES and REQUIRED FIELDS (only include fields listed, omit others):
 - iWPR:        {"name":"wpr14","type":"iWPR","period":14,"shift":0}
 - iMomentum:   {"name":"mom14","type":"iMomentum","period":14,"applied":0,"shift":0}
 - iATR:        {"name":"atr14","type":"iATR","period":14,"shift":0}
-- iADX:        {"name":"adx14","type":"iADX","period":14,"applied":0,"shift":0}
-- iMACD:       {"name":"macd","type":"iMACD","fast":12,"slow":26,"signal":9,"applied":0,"shift":0}
-- iBands:      {"name":"bb20","type":"iBands","period":20,"deviation":2.0,"method":0,"applied":0,"shift":0}
-- iStochastic: {"name":"sto","type":"iStochastic","kperiod":5,"dperiod":3,"slowing":3,"method":0,"shift":0}
+- iADX:        {"name":"adx14","type":"iADX","period":14,"applied":0,"line":0,"shift":0}
+               line: 0=ADX, 1=+DI, 2=-DI
+- iMACD:       {"name":"macd_main","type":"iMACD","fast":12,"slow":26,"signal":9,"applied":0,"line":0,"shift":0}
+               line: 0=main, 1=signal — ALWAYS set "line"
+- iBands:      {"name":"bb20_upper","type":"iBands","period":20,"deviation":2.0,"method":0,"applied":0,"line":1,"shift":0}
+               line: 0=middle, 1=upper, 2=lower — ALWAYS set "line"
+- iStochastic: {"name":"sto_k","type":"iStochastic","kperiod":5,"dperiod":3,"slowing":3,"method":0,"line":0,"shift":0}
+               line: 0=%K, 1=%D — ALWAYS set "line"
 - iSAR:        {"name":"sar","type":"iSAR","step":0.02,"maximum":0.2,"shift":0}
-- iAlligator:  {"name":"alli","type":"iAlligator","p1":13,"s1":8,"p2":8,"s2":5,"p3":5,"s3":3,"method":1,"applied":4,"shift":0}
-               p1/s1=Jaw period/shift, p2/s2=Teeth, p3/s3=Lips
-- iIchimoku:   {"name":"ichi","type":"iIchimoku","p1":9,"p2":26,"p3":52,"shift":0}
-               p1=Tenkan, p2=Kijun, p3=Senkou span B
+- iAlligator:  {"name":"alli_jaw","type":"iAlligator","p1":13,"s1":8,"p2":8,"s2":5,"p3":5,"s3":3,"method":1,"applied":4,"line":1,"shift":0}
+               line: 1=Jaw, 2=Teeth, 3=Lips — ALWAYS set "line"
+- iIchimoku:   {"name":"ichi_tenkan","type":"iIchimoku","p1":9,"p2":26,"p3":52,"line":1,"shift":0}
+               line: 1=Tenkan, 2=Kijun, 3=Senkou A, 4=Senkou B, 5=Chikou — ALWAYS set "line"
 
 CONDITION TYPES:
 - {"type":"AND","args":[...]}
@@ -601,10 +694,13 @@ struct Session {
     std::string prompt;
     JVal        condition;       // entry condition tree
     JVal        exit_condition;  // exit condition tree (empty = rely on SL/TP)
+    SeqState    seq_entry;       // SEQ state for entry condition
+    SeqState    seq_exit;        // SEQ state for exit condition
 };
 
 static std::map<int,Session> g_sessions;
 static std::mutex            g_mutex;
+static volatile bool         g_tick_debug = false;  // per-tick logging (off by default)
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // §11  Helpers
@@ -732,7 +828,6 @@ Bridge_Init(int sid, const wchar_t* prompt, const wchar_t* symbol,
     if (sym.empty()) sym = "EURUSD";
     Log("=== Bridge_Init sid="+std::to_string(sid)+" symbol="+sym
         +" tf="+std::to_string(tf)+" sl="+std::to_string(sl)+" tp="+std::to_string(tp));
-    Log("PROMPT("+std::to_string(prm.size())+"): "+prm.substr(0,120));
 
     // 1. POST /init to backend — token authenticates account+server
     std::string req_body =
@@ -745,17 +840,11 @@ Bridge_Init(int sid, const wchar_t* prompt, const wchar_t* symbol,
         ",\"sl\":"       + std::to_string(sl)       +
         ",\"tp\":"       + std::to_string(tp)       +
         ",\"account\":"  + std::to_string(account)  + "}";
-    Log("POST /init body: " + req_body);
-
     std::string raw = BackendPost("/init", req_body);
-    Log("DBG /init raw_len=" + std::to_string(raw.size()));
     if (raw.empty()) {
         FillBuf("{\"status\":\"error\",\"message\":\"Backend /init unavailable\"}", out_buf, buf_size);
         Log("ERROR: Backend /init no response (offline?)"); return -1;
     }
-    // Log full raw — split into chunks so MT4 log doesn't truncate
-    for (size_t _i = 0; _i < raw.size(); _i += 300)
-        Log("DBG RAW[" + std::to_string(_i) + "]: " + raw.substr(_i, 300));
 
     // 2. Parse backend response
     JVal resp = ParseJSON(raw);
@@ -765,10 +854,6 @@ Bridge_Init(int sid, const wchar_t* prompt, const wchar_t* symbol,
         FillBuf(err, out_buf, buf_size);
         Log("ERROR: backend /init non-JSON: " + raw.substr(0, 300)); return -1;
     }
-    Log("DBG resp.status=" + resp.str("status")
-        + " resp.message=" + resp.str("message","(none)")
-        + " resp.detail="  + resp.str("detail","(none)"));
-
     if (resp.str("status") != "ok") {
         // FastAPI errors use "detail", our errors use "message"
         std::string msg = resp.str("message", "");
@@ -784,9 +869,6 @@ Bridge_Init(int sid, const wchar_t* prompt, const wchar_t* symbol,
         Log("ERROR: config missing from backend response"); return -1;
     }
     JVal cfg = *cfg_node_outer;
-    Log("PARSED action=" + cfg.str("action")
-        + " tf=" + std::to_string(cfg.inum("tf"))
-        + " ohlc_bars=" + std::to_string(cfg.inum("ohlc_bars")));
 
     // 3. Validate condition tree exists
     auto* cond_check = cfg.get("condition");
@@ -796,11 +878,6 @@ Bridge_Init(int sid, const wchar_t* prompt, const wchar_t* symbol,
     }
 
     // (continue into existing parse + validate + session store below)
-    auto* _inds_check=cfg.get("indicators");
-    if(!_inds_check)             Log("PARSED indicators key: MISSING");
-    else if(!_inds_check->isArr())Log("PARSED indicators: NOT an array");
-    else Log("PARSED indicators array size: "+std::to_string(_inds_check->a.size()));
-
     auto* cond_node=cfg.get("condition"); // already validated above
 
     // 7. Build session
@@ -812,6 +889,12 @@ Bridge_Init(int sid, const wchar_t* prompt, const wchar_t* symbol,
     s.tp_pip   = cfg.num("tp_pip",tp);
     s.ohlc_bars= cfg.inum("ohlc_bars",5);
     s.condition= *cond_node;
+    // Store exit_condition if provided (must have a "type" key to be non-empty)
+    {
+        auto* ec = cfg.get("exit_condition");
+        if (ec && ec->isObj() && ec->get("type"))
+            s.exit_condition = *ec;
+    }
     // Use Claude-detected symbol if provided, else fallback to EA-passed symbol
     std::string claude_sym = cfg.str("symbol","");
     s.symbol = claude_sym.empty() ? sym : claude_sym;
@@ -821,30 +904,54 @@ Bridge_Init(int sid, const wchar_t* prompt, const wchar_t* symbol,
     // TF: prefer Claude's value, fallback to EA default (same as Python)
     int tf_claude=cfg.inum("tf",0);
     s.tf = tf_claude>0 ? tf_claude : tf;
-    Log(std::string("TF: ")+(tf_claude>0?"from Claude: ":"from EA: ")+std::to_string(s.tf));
 
     // 8. Validate params (maps to validate_output checks in Python)
-    if(s.action!="BUY"&&s.action!="SELL"){
+
+    // Check 1: action must be BUY or SELL
+    if (s.action != "BUY" && s.action != "SELL") {
+        char dbg[128];
+        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+            "FAIL action=\"%s\" — must be BUY or SELL", s.action.c_str());
+        Log(dbg);
         FillBuf("{\"status\":\"error\",\"message\":\"Invalid action\"}",out_buf,buf_size);
         return -1;
     }
-    if(s.lot<=0||s.lot>100){
+
+    // Check 2: lot must be in (0, 100]
+    if (s.lot <= 0 || s.lot > 100) {
+        char dbg[128];
+        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+            "FAIL lot=%.4f — must satisfy 0 < lot <= 100", s.lot);
+        Log(dbg);
         FillBuf("{\"status\":\"error\",\"message\":\"Invalid lot size\"}",out_buf,buf_size);
         return -1;
     }
-    if(s.sl_pip<=0||s.tp_pip<=0){
+
+    // Check 3: sl_pip and tp_pip must both be > 0
+    if (s.sl_pip <= 0 || s.tp_pip <= 0) {
+        char dbg[128];
+        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+            "FAIL sl_pip=%.1f tp_pip=%.1f — both must be > 0", s.sl_pip, s.tp_pip);
+        Log(dbg);
         FillBuf("{\"status\":\"error\",\"message\":\"SL/TP must be > 0\"}",out_buf,buf_size);
         return -1;
     }
-    if(s.tp_pip<s.sl_pip*0.5){  // MIN_TP_SL_RATIO = 0.5
+
+    // Check 4: tp_pip >= sl_pip * 0.5  (MIN_TP_SL_RATIO = 0.5)
+    if (s.tp_pip < s.sl_pip * 0.5) {
+        char dbg[160];
+        _snprintf_s(dbg, sizeof(dbg), _TRUNCATE,
+            "FAIL tp_pip=%.1f < sl_pip*0.5=%.1f — TP/SL ratio %.3f < 0.5",
+            s.tp_pip, s.sl_pip * 0.5, s.tp_pip / (s.sl_pip > 0 ? s.sl_pip : 1.0));
+        Log(dbg);
         FillBuf("{\"status\":\"error\",\"message\":\"TP/SL ratio too low\"}",out_buf,buf_size);
         return -1;
     }
 
     // 9. Dry-run condition with dummy values (maps to sandbox dry-run in Python)
-    if(!DryRunCondition(s.condition, s.ohlc_bars)){
+    if (!DryRunCondition(s.condition, s.ohlc_bars)) {
         FillBuf("{\"status\":\"error\",\"message\":\"Condition dry-run failed\"}",out_buf,buf_size);
-        Log("ERROR: condition dry-run failed"); return -1;
+        Log("ERROR: condition dry-run FAILED — condition tree may reference unknown variables"); return -1;
     }
 
     // 10. Store session
@@ -898,18 +1005,9 @@ Bridge_Init(int sid, const wchar_t* prompt, const wchar_t* symbol,
             o+="\"buffer_index\":"  +I(ind.inum("buffer_index",0));
             o+="}";
             ind_json+=o;
-
-            Log("IND["+std::to_string(i)+"]: name="+ind.str("name")
-                +" type="+ind.str("type")
-                +" period="+I(ind.inum("period"))
-                +" fast="+I(ind.inum("fast"))+" slow="+I(ind.inum("slow"))
-                +" p1="+I(ind.inum("p1"))+" p2="+I(ind.inum("p2"))+" p3="+I(ind.inum("p3")));
         }
         ind_json+="]";
-    } else {
-        Log("IND_JSON: empty — indicators array missing or empty in Claude response");
     }
-    Log("IND_JSON_FINAL: "+ind_json);
 
     // Use std::string to avoid fixed-size buffer overflow on many/complex indicators
     std::string ok_str=
@@ -949,16 +1047,49 @@ Bridge_Check(int sid, const wchar_t* values_json, int account,
     if(it==g_sessions.end()){
         FillBuf("{\"action\":\"NONE\"}",out_buf,buf_size); return -1;
     }
-    const Session& s=it->second;
+    Session& s=it->second;
 
     // Convert MQL4 wchar_t* → std::string then parse market values
     std::string vals_str = W2S(values_json);
     V vals=ParseValues(vals_str.c_str());
 
+    if (g_tick_debug) {
+        // ── Price snapshot ────────────────────────────────────────────────
+        char price_line[256];
+        _snprintf_s(price_line, sizeof(price_line), _TRUNCATE,
+            "TICK S%d %s │ ask=%.5f bid=%.5f │ O=%.5f H=%.5f L=%.5f C=%.5f",
+            sid + 1, s.symbol.c_str(),
+            vals.get("ask"), vals.get("bid"),
+            vals.O(0), vals.H(0), vals.L(0), vals.C(0));
+        Log(price_line);
+
+        // ── Indicator values (skip OHLCV and price keys) ──────────────────
+        std::string ind_line = "  INDS │";
+        static const std::string skip_prefixes[] = {
+            "open_","high_","low_","close_","volume_"
+        };
+        static const std::string skip_exact[] = {
+            "ask","bid","point"
+        };
+        for (auto& kv : vals.d) {
+            bool skip = false;
+            for (auto& p : skip_exact)
+                if (kv.first == p) { skip = true; break; }
+            if (!skip)
+                for (auto& p : skip_prefixes)
+                    if (kv.first.substr(0, p.size()) == p) { skip = true; break; }
+            if (skip) continue;
+            char buf[64];
+            _snprintf_s(buf, sizeof(buf), _TRUNCATE, " %s=%.5f", kv.first.c_str(), kv.second);
+            ind_line += buf;
+        }
+        Log(ind_line);
+    }
+
     // Exit condition evaluated first (higher priority than entry)
     if (s.exit_condition.get("type")) {
         bool should_exit = false;
-        try { should_exit = EvalCond(s.exit_condition, vals); }
+        try { should_exit = EvalCond(s.exit_condition, vals, &s.seq_exit); }
         catch(const std::exception& e){
             Log(std::string("EvalCond(exit) exception: ")+e.what());
         }
@@ -971,10 +1102,14 @@ Bridge_Check(int sid, const wchar_t* values_json, int account,
 
     // Entry condition
     bool signal=false;
-    try { signal=EvalCond(s.condition, vals); }
+    try { signal=EvalCond(s.condition, vals, &s.seq_entry); }
     catch(const std::exception& e){
         Log(std::string("EvalCond exception: ")+e.what());
         FillBuf("{\"action\":\"NONE\"}",out_buf,buf_size); return 0;
+    }
+
+    if (g_tick_debug) {
+        Log(std::string("  COND → ") + (signal ? "TRUE  *** SIGNAL ***" : "false"));
     }
 
     if(!signal){
@@ -1016,7 +1151,18 @@ Bridge_GetLastLog(char* out_buf, int buf_size) {
     return (int)g_last_debug.size();
 }
 
-} // extern "C"  — closes Bridge_Init/Check/Stop/Version/GetLastLog
+// Enable/disable per-tick logging in Bridge_Check.
+// enable=1 → log every tick (price snapshot + indicators + condition result)
+// enable=0 → silent (default, production mode)
+// WARNING: only enable during debugging — generates large log files on live accounts.
+__declspec(dllexport) void __stdcall
+Bridge_SetDebug(int enable)
+{
+    g_tick_debug = (enable != 0);
+    Log(std::string("Bridge_SetDebug → tick_debug=") + (g_tick_debug ? "ON" : "OFF"));
+}
+
+} // extern "C"  — closes Bridge_Init/Check/Stop/Version/GetLastLog/SetDebug
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // §WS  WebSocket helpers — OUTSIDE extern "C" so std::string return is valid
@@ -1072,7 +1218,6 @@ static void WsApplyConfig(int sid, const JVal& cfg) {
 
 // Process one received message, update g_sessions, push to queue for MQL4
 static void WsOnMessage(const std::string& msg) {
-    Log("WS recv(" + std::to_string(msg.size()) + "): " + msg.substr(0, 200));
     JVal j = ParseJSON(msg);
     if (!j.isObj()) { Log("WS: non-JSON message"); return; }
 
@@ -1520,7 +1665,7 @@ Bridge_WsSend(const wchar_t* msg_w)
 {
     std::string msg = W2S(msg_w);
     bool ok = WsSend(msg);
-    Log("Bridge_WsSend(" + std::to_string(msg.size()) + " bytes) ok=" + (ok?"1":"0"));
+    if (!ok) Log("Bridge_WsSend(" + std::to_string(msg.size()) + " bytes) failed");
     return ok ? 0 : -1;
 }
 

@@ -137,7 +137,7 @@ CLAUDE_API_KEY    = os.getenv("CLAUDE_API_KEY",    "")
 FRONTEND_URL      = os.getenv("FRONTEND_URL",     "http://192.168.21.1:3000")
 CLAUDE_CHAT_MODEL      = os.getenv("CLAUDE_CHAT_MODEL",      "claude-haiku-4-5")
 CLAUDE_PARSE_MODEL     = os.getenv("CLAUDE_PARSE_MODEL",     "claude-sonnet-4-6")
-CLAUDE_CHAT_MAX_TOKENS = int(os.getenv("CLAUDE_CHAT_MAX_TOKENS",  "512"))
+CLAUDE_CHAT_MAX_TOKENS = int(os.getenv("CLAUDE_CHAT_MAX_TOKENS",  "2048"))
 CLAUDE_PARSE_MAX_TOKENS= int(os.getenv("CLAUDE_PARSE_MAX_TOKENS", "2000"))
 
 app = FastAPI(title="AI Bridge License Server", version="1.0.0")
@@ -380,28 +380,84 @@ INDICATOR TYPES and REQUIRED FIELDS:
 - iWPR:        {"name":"wpr14","type":"iWPR","period":14,"shift":0}
 - iMomentum:   {"name":"mom14","type":"iMomentum","period":14,"applied":0,"shift":0}
 - iATR:        {"name":"atr14","type":"iATR","period":14,"shift":0}
-- iADX:        {"name":"adx14","type":"iADX","period":14,"applied":0,"shift":0}
-- iMACD:       {"name":"macd","type":"iMACD","fast":12,"slow":26,"signal":9,"applied":0,"shift":0}
-- iBands:      {"name":"bb20","type":"iBands","period":20,"deviation":2.0,"method":0,"applied":0,"shift":0}
-- iStochastic: {"name":"sto","type":"iStochastic","kperiod":5,"dperiod":3,"slowing":3,"method":0,"shift":0}
+- iADX:        {"name":"adx14","type":"iADX","period":14,"applied":0,"line":0,"shift":0}
+               line: 0=ADX value, 1=+DI, 2=-DI. ALWAYS set "line" explicitly.
+- iMACD:       {"name":"macd_main","type":"iMACD","fast":12,"slow":26,"signal":9,"applied":0,"line":0,"shift":0}
+               line: 0=main, 1=signal. ALWAYS set "line". For crossover: TWO entries (line=0 + line=1).
+- iBands:      {"name":"bb20_upper","type":"iBands","period":20,"deviation":2.0,"method":0,"applied":0,"line":1,"shift":0}
+               line: 0=middle, 1=upper, 2=lower. ALWAYS set "line". One entry per band needed.
+- iStochastic: {"name":"sto_k","type":"iStochastic","kperiod":5,"dperiod":3,"slowing":3,"method":0,"line":0,"shift":0}
+               line: 0=%K (main), 1=%D (signal). ALWAYS set "line" explicitly.
 - iSAR:        {"name":"sar","type":"iSAR","step":0.02,"maximum":0.2,"shift":0}
-- iAlligator:  {"name":"alli","type":"iAlligator","p1":13,"s1":8,"p2":8,"s2":5,"p3":5,"s3":3,"method":1,"applied":4,"shift":0}
-- iIchimoku:   {"name":"ichi","type":"iIchimoku","p1":9,"p2":26,"p3":52,"shift":0}
+- iAlligator:  {"name":"alli_jaw","type":"iAlligator","p1":13,"s1":8,"p2":8,"s2":5,"p3":5,"s3":3,"method":1,"applied":4,"line":1,"shift":0}
+               line: 1=Jaw, 2=Teeth, 3=Lips. ALWAYS set "line". One entry per line needed.
+- iIchimoku:   {"name":"ichi_tenkan","type":"iIchimoku","p1":9,"p2":26,"p3":52,"line":1,"shift":0}
+               line: 1=Tenkan, 2=Kijun, 3=Senkou A, 4=Senkou B, 5=Chikou. ALWAYS set "line".
 
 CONDITION TYPES:
 - {"type":"AND","args":[...]}
 - {"type":"OR","args":[...]}
 - {"type":"NOT","arg":{...}}
-- {"type":"CMP","left":"var_name"|number,"op":">/</>=/<=/==/!=","right":"var_name"|number}
+- {"type":"CMP","left":"var_name"|number|EXPR,"op":">/</>=/<=/==/!=","right":"var_name"|number|EXPR}
 - {"type":"FN","name":"fn_name","params":{"i":0,"n":3}}
+- {"type":"EXPR","op":"+|-|*|/|abs","left":"var_name"|number|EXPR,"right":"var_name"|number|EXPR}
+  EXPR computes arithmetic on indicator values or literals. Use inside CMP left/right.
+  abs is unary — only "left" needed: {"type":"EXPR","op":"abs","left":{...}}
+  Examples:
+    (ema20 - ema50) > 10 pips  → CMP(EXPR(ema20 - ema50) > EXPR(point * 100))
+    price 1% above ma50        → CMP(close_0 > EXPR(ma50 * 1.01))
+    |ema20 - ema50| > 20 pips  → CMP(EXPR(op="abs",left=EXPR(ema20-ema50)) > EXPR(point*200))
+    spread < 2 pips            → CMP(spread < EXPR(point * 20))
+    rsi_gap = rsi14 - 50 > 10  → CMP(EXPR(rsi14 - 50) > 10)
+  NOTE: "point" is always available as a value (the symbol's pip point size).
 
-PA FUNCTIONS: is_bull(i), is_bear(i), is_doji(i), is_hammer(i), is_shooting_star(i),
-is_pin_bar(i), is_bull_engulfing(), is_bear_engulfing(), is_morning_star(), is_evening_star(),
-is_uptrend(n), is_downtrend(n), is_bull_breakout(n), is_bear_breakout(n)
+PA FUNCTIONS (use in FN node, ONLY names from this list):
+  Single-candle (i=bar index, default 0):
+    is_bull(i), is_bear(i), is_doji(i), is_marubozu(i),
+    is_hammer(i), is_inverted_hammer(i), is_shooting_star(i), is_hanging_man(i),
+    is_pin_bar(i), is_pin_bar_bull(i), is_pin_bar_bear(i), is_spinning_top(i)
+  Two-candle (no params — uses bar 0 and bar 1, needs ohlc_bars>=2):
+    is_bull_engulfing(), is_bear_engulfing(), is_bull_harami(), is_bear_harami(),
+    is_piercing(), is_dark_cloud(), is_tweezer_top(), is_tweezer_bottom()
+  Three-candle (no params — uses bars 0-2, needs ohlc_bars>=3):
+    is_morning_star(), is_evening_star(),
+    is_three_white_soldiers(), is_three_black_crows(),
+    is_three_inside_up(), is_three_inside_down()
+  Market structure (n=lookback bars):
+    is_higher_high(n), is_lower_low(n), is_higher_low(n), is_lower_high(n),
+    is_uptrend(n), is_downtrend(n), is_consolidating(n),
+    is_bull_breakout(n), is_bear_breakout(n),
+    is_high_volume(n), is_accelerating_up(n), is_accelerating_down(n),
+    near_round_number()
 
 CROSSOVER RULE: "X crosses above Y" requires BOTH current and _prev variants:
   indicators: X(shift=0), X_prev(shift=1), Y(shift=0), Y_prev(shift=1)
   condition: CMP(X > Y) AND CMP(X_prev < Y_prev)
+
+CONSEC RULE: "condition for N consecutive bars" — expand inline to AND with shifted names:
+  "RSI14 < 30 for 3 bars" →
+    indicators: rsi14(shift=0), rsi14_1(shift=1), rsi14_2(shift=2)
+    condition: AND(CMP(rsi14<30), CMP(rsi14_1<30), CMP(rsi14_2<30))
+  Name pattern: {name} for shift=0, {name}_1 for shift=1, {name}_N for shift=N.
+
+TIME RULE: Use TIME node for session/hour filters:
+  {"type":"TIME","from":900,"to":1700}   → broker time 09:00–17:00
+  {"type":"TIME","from":2200,"to":200}   → crosses midnight (22:00–02:00)
+  "from" and "to" are HHMM integers (24h). Always combine with AND.
+
+SEQ RULE: "after A, then B on next bar" — use SEQ node for 2-step sequence:
+  {"type":"SEQ","step1":{...},"step2":{...},"bars":3}
+  step1 fires → DLL waits for a new bar → checks step2.
+  "bars" = max bars to wait for step2 before resetting (default 3).
+  SEQ fires a signal only when step2 confirms. step1 sets pending state.
+  Example: "after RSI<30, wait for bullish candle" →
+    indicators: rsi14(shift=0)
+    condition: SEQ(step1: CMP(rsi14<30), step2: FN(is_bull,i=0), bars=3)
+  IMPORTANT: SEQ maintains persistent state — always place SEQ at the top level
+  or as the FIRST argument in AND. If SEQ is not evaluated every tick (e.g.
+  short-circuited as a later AND arg), its state machine will stall.
+  LIMIT: Only ONE SEQ node is allowed per condition tree (entry or exit separately).
+  Do NOT use two SEQ nodes in the same condition.
 
 CRITICAL RULES:
 1. If instruction mentions ANY indicator, add it to indicators array AND reference in condition.
@@ -411,6 +467,12 @@ CRITICAL RULES:
 5. tf: minutes (1,5,15,30,60,240,1440); 0 if not specified.
 6. sl_pip and tp_pip must be > 0; tp_pip >= sl_pip * 0.5.
 7. ohlc_bars: minimum bars needed (crossover=2, default=3).
+   For PA FN with parameter n:
+     is_bull_breakout(n) / is_bear_breakout(n)  → ohlc_bars = n+1 (default n=20 → 21)
+     is_high_volume(n) / is_accelerating_up(n) / is_accelerating_down(n) → ohlc_bars = n+1
+     is_consolidating(n) / is_uptrend(n) / is_downtrend(n) → ohlc_bars = n
+   DLL clamps automatically if ohlc_bars is too small, but the lookback is reduced.
+   Always set ohlc_bars to the exact value required. MAX ohlc_bars = 50.
 8. exit_condition: ALWAYS include this field. If the instruction mentions an explicit exit/close condition, parse it here using the same indicator variable names from indicators array. If no explicit exit is mentioned, infer a logical reversal: for a BUY entry using crossover X>Y, the exit is X<Y crossover. If no reversal can be inferred, output "exit_condition": {} (empty = rely on SL/TP only).
 9. MAX indicators: 15. If more are needed, keep only the most essential ones.
 10. Only use FN names from the PA FUNCTIONS list above. NEVER invent function names.
@@ -441,16 +503,16 @@ _FEW_SHOT_USER2 = ('Instruction: "Sell USDJPY H4 when MACD crosses below signal 
                    'Symbol: USDJPY\nDefault lot: 0.100000, SL: 30 pips, TP: 60 pips')
 _FEW_SHOT_ASST2 = ('{"action":"SELL","tf":240,"lot":0.1,"sl_pip":30,"tp_pip":60,"ohlc_bars":2,'
                    '"indicators":['
-                   '{"name":"macd_main","type":"iMACD","fast":12,"slow":26,"signal":9,"applied":0,"shift":0},'
-                   '{"name":"macd_main_prev","type":"iMACD","fast":12,"slow":26,"signal":9,"applied":0,"shift":1},'
-                   '{"name":"macd_sig","type":"iMACD","fast":12,"slow":26,"signal":9,"applied":0,"shift":0},'
-                   '{"name":"macd_sig_prev","type":"iMACD","fast":12,"slow":26,"signal":9,"applied":0,"shift":1},'
-                   '{"name":"sto_main","type":"iStochastic","kperiod":5,"dperiod":3,"slowing":3,"method":0,"shift":0}],'
+                   '{"name":"macd_main","type":"iMACD","fast":12,"slow":26,"signal":9,"applied":0,"line":0,"shift":0},'
+                   '{"name":"macd_main_prev","type":"iMACD","fast":12,"slow":26,"signal":9,"applied":0,"line":0,"shift":1},'
+                   '{"name":"macd_sig","type":"iMACD","fast":12,"slow":26,"signal":9,"applied":0,"line":1,"shift":0},'
+                   '{"name":"macd_sig_prev","type":"iMACD","fast":12,"slow":26,"signal":9,"applied":0,"line":1,"shift":1},'
+                   '{"name":"sto_k","type":"iStochastic","kperiod":5,"dperiod":3,"slowing":3,"method":0,"line":0,"shift":0}],'
                    '"condition":{"type":"AND","args":['
                    '{"type":"AND","args":['
                    '{"type":"CMP","left":"macd_main","op":"<","right":"macd_sig"},'
                    '{"type":"CMP","left":"macd_main_prev","op":">","right":"macd_sig_prev"}]},'
-                   '{"type":"CMP","left":"sto_main","op":">","right":80}]},'
+                   '{"type":"CMP","left":"sto_k","op":">","right":80}]},'
                    '"exit_condition":{"type":"AND","args":['
                    '{"type":"CMP","left":"macd_main","op":">","right":"macd_sig"},'
                    '{"type":"CMP","left":"macd_main_prev","op":"<","right":"macd_sig_prev"}]}}')
@@ -535,11 +597,23 @@ def _collect_condition_vars(node: dict, out: set) -> None:
             v = node.get(side)
             if isinstance(v, str):
                 out.add(v)
+            elif isinstance(v, dict):
+                _collect_condition_vars(v, out)   # EXPR nested in CMP
+    elif t == "EXPR":
+        for side in ("left", "right"):
+            v = node.get(side)
+            if isinstance(v, str):
+                out.add(v)
+            elif isinstance(v, dict):
+                _collect_condition_vars(v, out)
     elif t in ("AND", "OR"):
         for child in node.get("args", []):
             _collect_condition_vars(child, out)
     elif t == "NOT":
         _collect_condition_vars(node.get("arg", {}), out)
+    elif t == "SEQ":
+        _collect_condition_vars(node.get("step1", {}), out)
+        _collect_condition_vars(node.get("step2", {}), out)
 
 
 def _collect_fn_names(node: dict, out: set) -> None:
@@ -556,6 +630,9 @@ def _collect_fn_names(node: dict, out: set) -> None:
             _collect_fn_names(child, out)
     elif t == "NOT":
         _collect_fn_names(node.get("arg", {}), out)
+    elif t == "SEQ":
+        _collect_fn_names(node.get("step1", {}), out)
+        _collect_fn_names(node.get("step2", {}), out)
 
 
 def _validate_strategy_config(config: dict) -> "tuple[bool, str]":
@@ -1060,7 +1137,8 @@ S1 (sid=0) · S2 (sid=1) · S3 (sid=2) · S4 (sid=3) · S5 (sid=4)
    clarifications, and status updates. Only list details when the user explicitly asks.
    Never repeat information the user already provided.
 
-1. **TOPIC GUARD** — You handle: strategy CRUD, manual orders, and live market data queries.
+1. **TOPIC GUARD** — You handle: strategy CRUD, manual orders, live market data queries,
+   and strategy suggestions/advice for users who don't know what to create.
    Politely decline anything else (general chat, news, fundamentals, predictions) in the user's
    own language and redirect to what you can do. Do not answer off-topic questions.
 
@@ -1200,6 +1278,38 @@ For multi-bar indicator history, set `bars=N` — the system returns values at s
 - current price only                                    → bars=1
 
 Always map temporal questions to bar shifts. Never say you cannot fetch historical data — you can fetch up to 50 bars on any timeframe.
+
+## STRATEGY SUGGESTIONS
+
+When a user says they don't know what strategy to create, asks for ideas, or asks "what should I
+trade", offer 5 ready-to-use examples covering different styles. Present them as a numbered list
+in the user's language. Each entry must show:
+  • Name / style
+  • Direction + instrument + entry condition (one sentence)
+  • Default SL / TP suggestion
+
+**Starter menu (adapt instrument/language to user context):**
+
+1. **MA Crossover (trend-following)**
+   Buy EURUSD when EMA20 crosses above EMA50 on H1 · SL 50 / TP 100
+
+2. **RSI Oversold/Overbought (mean-reversion)**
+   Buy EURUSD when RSI(14) drops below 30 on H1 · SL 40 / TP 80
+
+3. **MACD Cross (momentum)**
+   Buy EURUSD when MACD line crosses above signal line on H4 · SL 60 / TP 120
+
+4. **Bollinger Band Bounce (range)**
+   Buy EURUSD when price closes below lower Bollinger Band (20,2) on H1 · SL 40 / TP 80
+
+5. **Candlestick Pattern (price action)**
+   Buy EURUSD when bullish engulfing pattern appears on H4 · SL 50 / TP 100
+
+After presenting the list, ask which one they want to try (or if they want a customized version).
+Once the user picks one, immediately proceed into the normal ADD flow (collect slot/lot/SL/TP if
+not already clear, then confirm and execute).
+
+Do NOT ask "do you want suggestions?" — just offer them proactively when the user is lost.
 
 ## SYSTEM LIMITATIONS
 
@@ -1824,6 +1934,16 @@ async def ws_ea_connect(
                 if 0 <= sid <= 4:
                     _strategy_store_delete(account_number, sid)
                     await ws_chat_push(account_number, {"event": "strategy_delete", "sid": sid})
+
+            elif event == "signal_order_fail":
+                sid    = int(data.get("sid", 0)) + 1
+                action = data.get("action", "ORDER")
+                sym    = data.get("symbol", "")
+                lot    = data.get("lot", 0)
+                reason = data.get("reason", f"error {data.get('err', '?')}")
+                reply  = (f"❌ **S{sid} {action} {sym}** failed — {reason}\n"
+                          f"Lot: {lot}")
+                await ws_chat_push(account_number, {"event": "chat_reply", "reply": reply})
 
             elif event in ("order_result", "order_list", "order_history", "market_data"):
                 fut = _ea_pending.get(account_number)

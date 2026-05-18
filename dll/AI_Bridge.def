@@ -10,3 +10,6 @@ EXPORTS
     Bridge_WsPoll       @8
     Bridge_WsDisconnect @9
     Bridge_WsGetStatus  @10
+    Bridge_WsSend       @11
+    Bridge_Ping         @12
+    Bridge_SetDebug     @13

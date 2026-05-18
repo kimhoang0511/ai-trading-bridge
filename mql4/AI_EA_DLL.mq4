@@ -6,8 +6,8 @@
 //+------------------------------------------------------------------+
 #property strict
 #property description "AI Trading Bridge EA"
-#property description "Enter your strategies in S1_Prompt .. S5_Prompt"
-#property description "Leave prompt empty to disable that strategy slot"
+#property description "Set S1_Enable=true (and fill S1_Prompt) to activate a strategy"
+#property description "All strategies are disabled by default (S1_Enable..S5_Enable = false)"
 
 //── DLL import ───────────────────────────────────────────────────────
 #import "AI_Bridge.dll"
@@ -29,12 +29,15 @@
    int  Bridge_WsGetStatus (uchar &out_buf[], int buf_size);
    int  Bridge_WsSend      (string msg);
    int  Bridge_Ping        (uchar &out_buf[], int buf_size);
+   void Bridge_SetDebug    (int enable);
 #import
 
 //── Developer mode ───────────────────────────────────────────────────
-extern bool   Dev_Mode = true;    // true → override license_type = DEMO (no Market check)
+extern bool   Dev_Mode    = true;   // true → override license_type = DEMO (no Market check)
+extern bool   Tick_Debug  = false;  // true → log mọi tick vào bridge.log (chỉ dùng khi debug)
 
 //── Strategy 1 ───────────────────────────────────────────────────────
+extern bool            S1_Enable      = false;
 extern string          S1_Prompt      = "Buy EURUSD when MA20 crosses above MA50 and RSI14 < 65";
 extern ENUM_TIMEFRAMES S1_Default_TF  = PERIOD_H1;
 extern double          S1_Default_Lot = 0.10;
@@ -42,6 +45,7 @@ extern int             S1_Default_SL  = 50;
 extern int             S1_Default_TP  = 100;
 
 //── Strategy 2 ───────────────────────────────────────────────────────
+extern bool            S2_Enable      = false;
 extern string          S2_Prompt      = "";
 extern ENUM_TIMEFRAMES S2_Default_TF  = PERIOD_H4;
 extern double          S2_Default_Lot = 0.05;
@@ -49,6 +53,7 @@ extern int             S2_Default_SL  = 40;
 extern int             S2_Default_TP  = 80;
 
 //── Strategy 3 ───────────────────────────────────────────────────────
+extern bool            S3_Enable      = false;
 extern string          S3_Prompt      = "";
 extern ENUM_TIMEFRAMES S3_Default_TF  = PERIOD_D1;
 extern double          S3_Default_Lot = 0.01;
@@ -56,6 +61,7 @@ extern int             S3_Default_SL  = 200;
 extern int             S3_Default_TP  = 400;
 
 //── Strategy 4 ───────────────────────────────────────────────────────
+extern bool            S4_Enable      = false;
 extern string          S4_Prompt      = "";
 extern ENUM_TIMEFRAMES S4_Default_TF  = PERIOD_H1;
 extern double          S4_Default_Lot = 0.10;
@@ -63,6 +69,7 @@ extern int             S4_Default_SL  = 50;
 extern int             S4_Default_TP  = 100;
 
 //── Strategy 5 ───────────────────────────────────────────────────────
+extern bool            S5_Enable      = false;
 extern string          S5_Prompt      = "";
 extern ENUM_TIMEFRAMES S5_Default_TF  = PERIOD_H1;
 extern double          S5_Default_Lot = 0.10;
@@ -160,6 +167,12 @@ int OnInit()
       }
    }
 
+   // ── 0b. Tick debug mode ───────────────────────────────────────────────
+   Bridge_SetDebug(Tick_Debug ? 1 : 0);
+   if (Tick_Debug)
+      Print("[AI Bridge] ⚠️ Tick_Debug=true — per-tick logging enabled. "
+            "Disable after debugging to avoid large log files.");
+
    // ── 1. License check & registration ──────────────────────────────────
    int    lic_type = (int)MQLInfoInteger(MQL_LICENSE_TYPE);
    string srv      = AccountServer();
@@ -224,10 +237,8 @@ int OnInit()
    CleanObjects();
    LoadSlots();
 
-   if (g_active == 0) {
-      Alert("No strategy configured. Set at least S1_Prompt.");
-      return INIT_FAILED;
-   }
+   if (g_active == 0)
+      Print("[AI Bridge] No strategy enabled locally — use chat bot to add strategies.");
 
    // Show DLL version
    uchar ver_buf[];
@@ -241,9 +252,6 @@ int OnInit()
 
       uchar out[];
       ArrayResize(out, BUF_SIZE);
-
-      Print("DBG Bridge_Init S", i, " sym=", g_slots[i].symbol,
-            " tf=", g_slots[i].tf, " prompt=", StringSubstr(g_slots[i].prompt,0,40));
 
       int rc = Bridge_Init(
          i,
@@ -259,9 +267,6 @@ int OnInit()
       );
 
       string res = CharArrayToString(out, 0, -1);
-      string resp_preview = StringSubstr(res, 0, 200);
-      Print("DBG Bridge_Init S", i, " rc=", rc, " resp=", resp_preview);
-
       if (StringFind(res, "\"status\":\"ok\"") < 0) {
          // Print full DLL debug log — shows raw backend response, token, etc.
          PrintDllLog("DLL_LOG S" + IntegerToString(i));
@@ -301,14 +306,6 @@ int OnInit()
       // Lưu action (BUY/SELL) từ Bridge_Init response
       string act = ExtractStr(res, "action");
       if (StringLen(act) > 0) g_slots[i].action = act;
-      Print("DBG S", i, " action=", g_slots[i].action,
-            " tf=", g_slots[i].tf, " ohlc_bars=", g_slots[i].ohlc_bars,
-            " ind_count=", g_slots[i].ind_count);
-      for (int k = 0; k < g_slots[i].ind_count; k++)
-         Print("DBG   ind[", k, "] name=", g_slots[i].inds[k].name,
-               " type=", g_slots[i].inds[k].type,
-               " period=", g_slots[i].inds[k].period,
-               " shift=", g_slots[i].inds[k].shift);
 
       // Open a dedicated chart for each active strategy
       g_slots[i].chart_id = OpenStrategyChart(i);
@@ -319,10 +316,8 @@ int OnInit()
             StringSubstr(g_slots[i].prompt, 0, 50));
    }
 
-   if (g_active == 0) {
-      Alert("All strategies failed to initialize.");
-      return INIT_FAILED;
-   }
+   if (g_active == 0)
+      Print("[AI Bridge] No active strategy — waiting for chat bot to add strategies.");
 
    // Draw each strategy's panel on its own chart
    for (int j = 0; j < MAX_STRATEGIES; j++) {
@@ -520,7 +515,7 @@ string BuildValues(int sid)
 {
    StrategySlot s = g_slots[sid];
    string parts[];
-   int    n = s.ohlc_bars * 5 + s.ind_count + 5;
+   int    n = s.ohlc_bars * 5 + s.ind_count + 6; // 6 fixed: ask,bid,point,spread,time,bar_time
    ArrayResize(parts, n);
    int idx = 0;
 
@@ -533,11 +528,12 @@ string BuildValues(int sid)
       parts[idx++] = "\"volume_"+si+"\":"+DoubleToStr((double)iVolume(s.symbol,s.tf,i),0);
    }
 
-   parts[idx++] = "\"ask\":"   +DoubleToStr(MarketInfo(s.symbol,MODE_ASK),5);
-   parts[idx++] = "\"bid\":"   +DoubleToStr(MarketInfo(s.symbol,MODE_BID),5);
-   parts[idx++] = "\"point\":"+DoubleToStr(MarketInfo(s.symbol,MODE_POINT),5);
-   parts[idx++] = "\"spread\":"+DoubleToStr(MarketInfo(s.symbol,MODE_SPREAD),1);
-   parts[idx++] = "\"time\":"  +IntegerToString((int)TimeCurrent());
+   parts[idx++] = "\"ask\":"      +DoubleToStr(MarketInfo(s.symbol,MODE_ASK),5);
+   parts[idx++] = "\"bid\":"      +DoubleToStr(MarketInfo(s.symbol,MODE_BID),5);
+   parts[idx++] = "\"point\":"   +DoubleToStr(MarketInfo(s.symbol,MODE_POINT),5);
+   parts[idx++] = "\"spread\":"  +DoubleToStr(MarketInfo(s.symbol,MODE_SPREAD),1);
+   parts[idx++] = "\"time\":"    +IntegerToString((int)TimeCurrent());
+   parts[idx++] = "\"bar_time\":"+IntegerToString((int)iTime(s.symbol,s.tf,0));
 
    for (int i = 0; i < s.ind_count; i++) {
       double val = CalcIndicator(s.inds[i]);
@@ -1113,7 +1109,7 @@ void HandleWsEvent(string msg)
       }
 
       g_slots[sid].active = true;
-      if (was_inactive) { g_active++; g_slots[sid].enabled = true; }
+      if (was_inactive) { g_active++; g_slots[sid].enabled = true; g_last_signal_bar[sid] = 0; }
       if (StringFind(msg, "\"enabled\"") >= 0)
          g_slots[sid].enabled = ((int)ExtractNum(msg, "enabled") != 0);
 
@@ -1191,6 +1187,7 @@ void HandleWsEvent(string msg)
       if (g_slots[sid].active) {
          Bridge_Stop(sid);
          g_slots[sid].active = false;
+         g_last_signal_bar[sid] = 0;
          g_active = MathMax(g_active - 1, 0);
          // Close this slot's dedicated chart window
          if (g_slots[sid].chart_id > 0 && g_slots[sid].chart_id != ChartID())
@@ -1248,32 +1245,74 @@ void HandleSignal(int sid, string res)
 
    if (HasOpenOrder(sym, magic)) return;
 
+   string slot_tag    = "AI-S" + IntegerToString(sid+1) + ": ";
+   int    max_entry   = 31 - StringLen(slot_tag) - 3;
+   bool   truncated   = StringLen(s.prompt) > max_entry;
+   string entry_short = StringSubstr(s.prompt, 0, max_entry) + (truncated ? "..." : "");
+   string order_comment = slot_tag + entry_short;
+
    if (action == "BUY") {
       double ask = MarketInfo(sym, MODE_ASK);
       int ticket = OrderSend(sym, OP_BUY, lot, ask, 3,
                              ask - sl_pip*pt, ask + tp_pip*pt,
-                             "AI-S"+IntegerToString(sid), magic, 0, clrBlue);
+                             order_comment, magic, 0, clrBlue);
       if (ticket > 0) {
          Print("S", sid, " BUY ", sym, " lot=", lot);
          DrawSignalArrow(sid, "BUY", sym, s.tf);
          DrawDashboard();
       } else {
-         Print("S", sid, " BUY failed: ", GetLastError());
+         int err = GetLastError();
+         Print("S", sid, " BUY failed: ", err);
+         NotifyOrderFail(sid, "BUY", sym, lot, err);
       }
    }
    else if (action == "SELL") {
       double bid = MarketInfo(sym, MODE_BID);
       int ticket = OrderSend(sym, OP_SELL, lot, bid, 3,
                              bid + sl_pip*pt, bid - tp_pip*pt,
-                             "AI-S"+IntegerToString(sid), magic, 0, clrRed);
+                             order_comment, magic, 0, clrRed);
       if (ticket > 0) {
          Print("S", sid, " SELL ", sym, " lot=", lot);
          DrawSignalArrow(sid, "SELL", sym, s.tf);
          DrawDashboard();
       } else {
-         Print("S", sid, " SELL failed: ", GetLastError());
+         int err = GetLastError();
+         Print("S", sid, " SELL failed: ", err);
+         NotifyOrderFail(sid, "SELL", sym, lot, err);
       }
    }
+}
+
+string OrderErrorStr(int err)
+{
+   switch(err) {
+      case 130: return "Invalid stops — SL/TP too close to price (ERR_INVALID_STOPS)";
+      case 131: return "Invalid lot size (ERR_INVALID_TRADE_VOLUME)";
+      case 132: return "Market is closed (ERR_MARKET_CLOSED)";
+      case 133: return "Trading is disabled on this account (ERR_TRADE_DISABLED)";
+      case 134: return "Not enough money (ERR_NOT_ENOUGH_MONEY)";
+      case 135: return "Price changed — retry (ERR_PRICE_CHANGED)";
+      case 136: return "No quotes available (ERR_OFF_QUOTES)";
+      case 137: return "Broker is busy (ERR_BROKER_BUSY)";
+      case 138: return "Requote — price moved (ERR_REQUOTE)";
+      case 145: return "Modification denied (ERR_TRADE_MODIFY_DENIED)";
+      case 146: return "Trade context busy (ERR_TRADE_CONTEXT_BUSY)";
+      case 4109: return "DLL calls not allowed — enable DLL imports in EA settings";
+      default:  return "Unknown error " + IntegerToString(err);
+   }
+}
+
+void NotifyOrderFail(int sid, string action, string sym, double lot, int err)
+{
+   string msg = "{\"event\":\"signal_order_fail\""
+              + ",\"sid\":"      + IntegerToString(sid)
+              + ",\"action\":\"" + action + "\""
+              + ",\"symbol\":\"" + sym    + "\""
+              + ",\"lot\":"      + DoubleToStr(lot, 2)
+              + ",\"err\":"      + IntegerToString(err)
+              + ",\"reason\":\"" + OrderErrorStr(err) + "\""
+              + "}";
+   Bridge_WsSend(msg);
 }
 
 //+------------------------------------------------------------------+
@@ -1310,6 +1349,7 @@ string ParseSymbolFromPrompt(string prompt)
 void LoadSlots()
 {
    string prompts[MAX_STRATEGIES];
+   bool   enables[MAX_STRATEGIES];
    int    tfs[MAX_STRATEGIES];
    double lots[MAX_STRATEGIES];
    int    sls[MAX_STRATEGIES];
@@ -1317,6 +1357,8 @@ void LoadSlots()
 
    prompts[0]=S1_Prompt; prompts[1]=S2_Prompt; prompts[2]=S3_Prompt;
    prompts[3]=S4_Prompt; prompts[4]=S5_Prompt;
+   enables[0]=S1_Enable; enables[1]=S2_Enable; enables[2]=S3_Enable;
+   enables[3]=S4_Enable; enables[4]=S5_Enable;
    tfs[0]=S1_Default_TF;  tfs[1]=S2_Default_TF;  tfs[2]=S3_Default_TF;
    tfs[3]=S4_Default_TF;  tfs[4]=S5_Default_TF;
    lots[0]=S1_Default_Lot; lots[1]=S2_Default_Lot; lots[2]=S3_Default_Lot;
@@ -1329,7 +1371,7 @@ void LoadSlots()
    g_active = 0;
    for (int i = 0; i < MAX_STRATEGIES; i++) {
       g_slots[i].active    = (StringLen(prompts[i]) > 0);
-      g_slots[i].enabled   = true;
+      g_slots[i].enabled   = enables[i];
       g_slots[i].prompt    = prompts[i];
       g_slots[i].symbol    = Symbol(); // fallback = chart hiện tại; Claude sẽ override
       g_slots[i].tf        = tfs[i];
@@ -1544,15 +1586,9 @@ string StringJoin(string &arr[], string sep)
 //+------------------------------------------------------------------+
 void DrawSignalArrow(int sid, string action, string sym, int tf)
 {
-   // Vẽ lên chart riêng của strategy (nếu có), hoặc chart hiện tại nếu đúng symbol
    long cid = g_slots[sid].chart_id;
-   Print("DBG DrawSignalArrow sid=", sid, " action=", action,
-         " sym=", sym, " cid=", cid);
    if (cid <= 0) {
-      if (sym != Symbol()) {
-         Print("DBG arrow skip: sym mismatch (", sym, " vs ", Symbol(), ")");
-         return;
-      }
+      if (sym != Symbol()) return;
       cid = ChartID();
    }
 
@@ -1564,9 +1600,7 @@ void DrawSignalArrow(int sid, string action, string sym, int tf)
 
    if (action == "BUY") {
       double price = iLow(sym, tf, 1) - MarketInfo(sym, MODE_POINT) * 50;
-      bool ok = ObjectCreate(cid, obj_name, OBJ_ARROW, 0, bar_time, price);
-      Print("DBG arrow BUY create=", ok, " err=", GetLastError(),
-            " price=", price, " time=", TimeToStr(bar_time));
+      ObjectCreate(cid, obj_name, OBJ_ARROW, 0, bar_time, price);
       ObjectSetInteger(cid, obj_name, OBJPROP_ARROWCODE, 241);
       ObjectSetInteger(cid, obj_name, OBJPROP_COLOR,     clrDodgerBlue);
       ObjectSetInteger(cid, obj_name, OBJPROP_WIDTH,     2);
@@ -1575,9 +1609,7 @@ void DrawSignalArrow(int sid, string action, string sym, int tf)
    }
    else if (action == "SELL") {
       double price = iHigh(sym, tf, 1) + MarketInfo(sym, MODE_POINT) * 50;
-      bool ok = ObjectCreate(cid, obj_name, OBJ_ARROW, 0, bar_time, price);
-      Print("DBG arrow SELL create=", ok, " err=", GetLastError(),
-            " price=", price, " time=", TimeToStr(bar_time));
+      ObjectCreate(cid, obj_name, OBJ_ARROW, 0, bar_time, price);
       ObjectSetInteger(cid, obj_name, OBJPROP_ARROWCODE, 242);
       ObjectSetInteger(cid, obj_name, OBJPROP_COLOR,     clrCrimson);
       ObjectSetInteger(cid, obj_name, OBJPROP_WIDTH,     2);
@@ -1586,7 +1618,6 @@ void DrawSignalArrow(int sid, string action, string sym, int tf)
    }
 
    ChartRedraw(cid);
-   Print("DBG arrow done cid=", cid);
 }
 
 //+------------------------------------------------------------------+
@@ -1594,8 +1625,6 @@ void DrawSignalArrow(int sid, string action, string sym, int tf)
 //+------------------------------------------------------------------+
 void DrawDashboard()
 {
-   Print("DBG DrawDashboard on chart=", ChartID());
-
    int x = 10, y = 20, line_h = 16;
    color bg         = C'20,20,40';
    color title_clr  = clrGold;
@@ -1604,10 +1633,8 @@ void DrawDashboard()
 
    // Background rectangle
    string bg_name = OBJ_PREFIX + "PANEL_BG";
-   if (ObjectFind(bg_name) < 0) {
-      bool ok = ObjectCreate(bg_name, OBJ_RECTANGLE_LABEL, 0, 0, 0);
-      Print("DBG PANEL_BG create=", ok, " err=", GetLastError());
-   }
+   if (ObjectFind(bg_name) < 0)
+      ObjectCreate(bg_name, OBJ_RECTANGLE_LABEL, 0, 0, 0);
    ObjectSet(bg_name, OBJPROP_CORNER,      CORNER_LEFT_UPPER);
    ObjectSet(bg_name, OBJPROP_XDISTANCE,   x - 5);
    ObjectSet(bg_name, OBJPROP_YDISTANCE,   y - 5);
@@ -1619,10 +1646,8 @@ void DrawDashboard()
 
    // Title
    string t_name = OBJ_PREFIX + "PANEL_TITLE";
-   if (ObjectFind(t_name) < 0) {
-      bool ok = ObjectCreate(t_name, OBJ_LABEL, 0, 0, 0);
-      Print("DBG PANEL_TITLE create=", ok, " err=", GetLastError());
-   }
+   if (ObjectFind(t_name) < 0)
+      ObjectCreate(t_name, OBJ_LABEL, 0, 0, 0);
    ObjectSet(t_name, OBJPROP_CORNER,    CORNER_LEFT_UPPER);
    ObjectSet(t_name, OBJPROP_XDISTANCE, x);
    ObjectSet(t_name, OBJPROP_YDISTANCE, y);
@@ -1633,10 +1658,8 @@ void DrawDashboard()
    // One row per strategy slot
    for (int i = 0; i < MAX_STRATEGIES; i++) {
       string row_name = OBJ_PREFIX + "PANEL_S" + IntegerToString(i);
-      if (ObjectFind(row_name) < 0) {
-         bool ok = ObjectCreate(row_name, OBJ_LABEL, 0, 0, 0);
-         Print("DBG PANEL_S", i, " create=", ok, " err=", GetLastError());
-      }
+      if (ObjectFind(row_name) < 0)
+         ObjectCreate(row_name, OBJ_LABEL, 0, 0, 0);
       ObjectSet(row_name, OBJPROP_CORNER,    CORNER_LEFT_UPPER);
       ObjectSet(row_name, OBJPROP_XDISTANCE, x);
       ObjectSet(row_name, OBJPROP_YDISTANCE, y + line_h * (i + 1) + 4);
@@ -1655,7 +1678,6 @@ void DrawDashboard()
          ObjectSet(row_name, OBJPROP_COLOR,      row_clr);
          ObjectSet(row_name, OBJPROP_SELECTABLE, true);  // cho phép click
          ObjectSetString(0, row_name, OBJPROP_TEXT, label);
-         Print("DBG dashboard row S", i, ": ", label);
       } else {
          ObjectSet(row_name, OBJPROP_COLOR,      off_clr);
          ObjectSet(row_name, OBJPROP_SELECTABLE, false);
@@ -1664,10 +1686,7 @@ void DrawDashboard()
       }
    }
 
-   int err = GetLastError();
-   if (err != 0) Print("DBG DrawDashboard trailing err=", err);
    ChartRedraw();
-   Print("DBG DrawDashboard done");
 }
 
 //+------------------------------------------------------------------+
@@ -1822,40 +1841,24 @@ long OpenStrategyChart(int sid)
    string sym = g_slots[sid].symbol;
    int    tf  = g_slots[sid].tf;
 
-   Print("DBG OpenStrategyChart S", sid, " target=", sym, "/", TFtoStr(tf),
-         " current=", Symbol(), "/", TFtoStr(Period()), " ChartID=", ChartID());
-
    // Không mở nếu đã là chart hiện tại
-   if (sym == Symbol() && tf == Period()) {
-      Print("DBG → same as current chart, use ChartID=", ChartID());
+   if (sym == Symbol() && tf == Period())
       return ChartID();
-   }
 
    // Kiểm tra chart đã mở chưa — tránh mở trùng
    long cid = ChartFirst();
-   Print("DBG ChartFirst=", cid);
    int iter = 0;
    while (cid >= 0) {
-      Print("DBG   chart[", iter, "] id=", cid,
-            " sym=", ChartSymbol(cid), " tf=", ChartPeriod(cid));
-      if (ChartSymbol(cid) == sym && ChartPeriod(cid) == tf) {
-         Print("DBG → found existing chart id=", cid);
+      if (ChartSymbol(cid) == sym && ChartPeriod(cid) == tf)
          return cid;
-      }
       cid = ChartNext(cid);
-      iter++;
-      if (iter > 30) { Print("DBG chart scan safety break"); break; }
+      if (++iter > 30) break;
    }
 
    // Mở chart mới
-   Print("DBG ChartOpen(", sym, ",", tf, ")...");
    cid = ChartOpen(sym, tf);
-   int err = GetLastError();
-   Print("DBG ChartOpen result=", cid, " err=", err);
-
    if (cid <= 0) {
-      Print("ERROR: Cannot open chart for S", sid+1, " ", sym, " ", TFtoStr(tf),
-            " (err=", err, ") — check symbol in Market Watch");
+      Print("[AI Bridge] Cannot open chart S", sid+1, " ", sym, " ", TFtoStr(tf));
       return 0;
    }
 
@@ -1873,7 +1876,6 @@ long OpenStrategyChart(int sid)
    ChartSetInteger(cid, CHART_COLOR_GRID,        C'30,30,50');
 
    ChartRedraw(cid);
-   Print("DBG Chart opened OK id=", cid, " for S", sid+1, " ", sym, " ", TFtoStr(tf));
    return cid;
 }
 
@@ -1883,31 +1885,9 @@ long OpenStrategyChart(int sid)
 //+------------------------------------------------------------------+
 void DrawIndicators(int sid, long cid)
 {
+   if (cid <= 0) return;
    int ic = g_slots[sid].ind_count;
-   Print("DBG DrawIndicators sid=", sid, " cid=", cid, " ind_count=", ic);
-
-   // Luôn vẽ label debug lên chart để user thấy ngay — dù có indicator hay không
-   string dbg_n = OBJ_PREFIX+"IND_STATUS_S"+IntegerToString(sid);
-   ObjectDelete(cid, dbg_n);
-   ObjectCreate(cid, dbg_n, OBJ_LABEL, 0, 0, 0);
-   ObjectSetInteger(cid, dbg_n, OBJPROP_CORNER,    CORNER_LEFT_LOWER);
-   ObjectSetInteger(cid, dbg_n, OBJPROP_XDISTANCE, 10);
-   ObjectSetInteger(cid, dbg_n, OBJPROP_YDISTANCE, 20);
-   ObjectSetInteger(cid, dbg_n, OBJPROP_FONTSIZE,  8);
-   if (ic == 0) {
-      ObjectSetInteger(cid, dbg_n, OBJPROP_COLOR, clrOrangeRed);
-      ObjectSetString (cid, dbg_n, OBJPROP_TEXT,
-         "ind_count=0  (PA-only strategy — no indicator lines)");
-      Print("DBG DrawIndicators skip: no indicators");
-      ChartRedraw(cid);
-      return;
-   }
-   ObjectSetInteger(cid, dbg_n, OBJPROP_COLOR, clrLimeGreen);
-   ObjectSetString (cid, dbg_n, OBJPROP_TEXT,
-      "ind_count="+IntegerToString(ic)+"  drawing...");
-   ChartRedraw(cid);
-
-   if (cid <= 0) { Print("DBG DrawIndicators skip: cid=0"); return; }
+   if (ic == 0) { ChartRedraw(cid); return; }
 
    // Force MT4 load history trước khi gọi iMA/iRSI
    RefreshRates();
@@ -1970,11 +1950,7 @@ void DrawIndicators(int sid, long cid)
          string pfx = OBJ_PREFIX+"IND_"+c.name+"_S"+IntegerToString(sid)+"_";
 
          double test_v = iMA(sym,tf,c.period,c.ma_shift,c.method,ap,1);
-         Print("DBG ", c.name, "(", c.period, ") test val[1]=", test_v);
-         if (test_v == 0) {
-            Print("DBG WARN: iMA=0, history not ready — retry next bar");
-            continue;
-         }
+         if (test_v == 0) continue;
 
          DRAW_TREND_LINE(pfx,
             iMA(sym,tf,c.period,c.ma_shift,c.method,ap,_i),
@@ -2030,7 +2006,6 @@ void DrawIndicators(int sid, long cid)
             sar_drawn++;
          }
          total_drawn += sar_drawn;
-         Print("DBG SAR drew ", sar_drawn, " dots");
       }
 
       //── Alligator — 3 MA lines ────────────────────────────────────
@@ -2142,23 +2117,14 @@ void DrawIndicators(int sid, long cid)
       }
 
       else {
-         Print("DBG DrawIndicators: unhandled type=", c.type, " name=", c.name);
+         Print("[AI Bridge] Unknown indicator type: ", c.type);
       }
    }
 
    #undef DRAW_TREND_LINE
    #undef DRAW_OSC_LABEL
 
-   // Update status label với kết quả thực tế
-   ObjectSetString(cid, dbg_n, OBJPROP_TEXT,
-      "ind_count="+IntegerToString(ic)+"  obj_drawn="+IntegerToString(total_drawn));
-   ObjectSetInteger(cid, dbg_n, OBJPROP_COLOR,
-      (total_drawn > 0) ? clrLimeGreen : clrOrangeRed);
-
-   // Update strategy info panel with current indicator values
    DrawStrategyInfo(sid, cid);
-
-   Print("DBG DrawIndicators done: total_drawn=", total_drawn);
    ChartRedraw(cid);
 }
 
