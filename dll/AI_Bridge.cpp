@@ -598,8 +598,9 @@ struct Session {
     double      lot=0.1, sl_pip=50, tp_pip=100;
     int         ohlc_bars=3, tf=0;
     std::string symbol;
-    std::string prompt;      // original strategy prompt
-    JVal        condition;   // JSON condition tree evaluated each tick
+    std::string prompt;
+    JVal        condition;       // entry condition tree
+    JVal        exit_condition;  // exit condition tree (empty = rely on SL/TP)
 };
 
 static std::map<int,Session> g_sessions;
@@ -657,8 +658,50 @@ static bool DryRunCondition(const JVal& cond, int ohlc_bars) {
 // §12  DLL entry
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// Safe early log — only WinAPI, no CRT, callable before global C++ objects init.
+static void DllStartupLog(const char* msg) {
+    char dir[MAX_PATH] = {}, path[MAX_PATH] = {};
+    ExpandEnvironmentStringsA("%APPDATA%", dir, MAX_PATH);
+    // Build path manually (no snprintf — CRT may not be ready)
+    lstrcatA(dir, "\\AI_Bridge");
+    CreateDirectoryA(dir, nullptr);
+    lstrcpyA(path, dir);
+    lstrcatA(path, "\\startup.log");
+    HANDLE h = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ,
+                           nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    SYSTEMTIME t; GetLocalTime(&t);
+    char line[512] = {};
+    // wsprintf is safe before CRT init
+    wsprintfA(line, "[%02d:%02d:%02d] %s\r\n",
+              t.wHour, t.wMinute, t.wSecond, msg);
+    DWORD n;
+    WriteFile(h, line, (DWORD)lstrlenA(line), &n, nullptr);
+    CloseHandle(h);
+}
+
 BOOL APIENTRY DllMain(HMODULE hmod, DWORD reason, LPVOID) {
-    if(reason==DLL_PROCESS_ATTACH){ g_hmod=hmod; DisableThreadLibraryCalls(hmod); }
+    if (reason == DLL_PROCESS_ATTACH) {
+        g_hmod = hmod;
+        DisableThreadLibraryCalls(hmod);
+        try {
+            DllStartupLog("=== AI_Bridge.dll ATTACH begin (v" BRIDGE_VERSION ")");
+            // Smoke-test globals declared before DllMain (g_ws_queue is declared later)
+            (void)g_sessions.size();
+            (void)g_last_debug.size();
+            DllStartupLog("=== AI_Bridge.dll ATTACH ok — globals init OK");
+        } catch (const std::exception& e) {
+            std::string m = "EXCEPTION in ATTACH: ";
+            m += e.what();
+            DllStartupLog(m.c_str());
+            return FALSE;
+        } catch (...) {
+            DllStartupLog("UNKNOWN EXCEPTION in ATTACH");
+            return FALSE;
+        }
+    } else if (reason == DLL_PROCESS_DETACH) {
+        DllStartupLog("=== AI_Bridge.dll DETACH");
+    }
     return TRUE;
 }
 
@@ -912,7 +955,21 @@ Bridge_Check(int sid, const wchar_t* values_json, int account,
     std::string vals_str = W2S(values_json);
     V vals=ParseValues(vals_str.c_str());
 
-    // Evaluate condition tree (maps to sandbox_run(code, values))
+    // Exit condition evaluated first (higher priority than entry)
+    if (s.exit_condition.get("type")) {
+        bool should_exit = false;
+        try { should_exit = EvalCond(s.exit_condition, vals); }
+        catch(const std::exception& e){
+            Log(std::string("EvalCond(exit) exception: ")+e.what());
+        }
+        if (should_exit) {
+            FillBuf("{\"action\":\"EXIT\"}",out_buf,buf_size);
+            Log("EXIT signal → "+s.symbol);
+            return 0;
+        }
+    }
+
+    // Entry condition
     bool signal=false;
     try { signal=EvalCond(s.condition, vals); }
     catch(const std::exception& e){
@@ -924,7 +981,6 @@ Bridge_Check(int sid, const wchar_t* values_json, int account,
         FillBuf("{\"action\":\"NONE\"}",out_buf,buf_size); return 0;
     }
 
-    // Signal fired — validate and return (maps to validate_output())
     char res[256];
     _snprintf_s(res,sizeof(res),_TRUNCATE,
         "{\"action\":\"%s\",\"lot\":%.2f,\"sl\":%.1f,\"tp\":%.1f}",
@@ -1000,6 +1056,9 @@ static void WsApplyConfig(int sid, const JVal& cfg) {
     s.tp_pip    = cfg.num("tp_pip", -1.0) >= 0 ? cfg.num("tp_pip", 100) : cfg.num("tp", 100);
     s.ohlc_bars = cfg.inum("ohlc_bars", 3);
     s.condition = *cond;
+    auto* exit_cond = cfg.get("exit_condition");
+    if (exit_cond && exit_cond->isObj() && exit_cond->get("type"))
+        s.exit_condition = *exit_cond;
     if (!DryRunCondition(s.condition, s.ohlc_bars)) {
         Log("WS: DryRun failed sid=" + std::to_string(sid) + " — skip");
         return;
@@ -1429,6 +1488,40 @@ Bridge_Register(int account, const wchar_t* server_broker, int license_type,
 
     Log("=== Bridge_Register OK token="+rv.str("token").substr(0,30)+"...");
     return 0;
+}
+
+// Simple alive-check — call in OnInit to confirm DLL loaded without crashing.
+// Returns 0 and fills out_buf with version JSON.
+__declspec(dllexport) int __stdcall
+Bridge_Ping(char* out_buf, int buf_size)
+{
+    try {
+        std::string r = "{\"status\":\"ok\",\"version\":\"" BRIDGE_VERSION "\","
+                        "\"sessions\":" + std::to_string(g_sessions.size()) +
+                        ",\"ws_connected\":" + (g_ws_connected ? "true" : "false") + "}";
+        FillBuf(r, out_buf, buf_size);
+        Log("Bridge_Ping OK");
+        return 0;
+    } catch (const std::exception& e) {
+        FillBuf((std::string("{\"status\":\"error\",\"message\":\"") + e.what() + "\"}").c_str(),
+                out_buf, buf_size);
+        return -1;
+    } catch (...) {
+        FillBuf("{\"status\":\"error\",\"message\":\"unknown exception in Bridge_Ping\"}",
+                out_buf, buf_size);
+        return -1;
+    }
+}
+
+// Send an arbitrary UTF-8 JSON string from MQL4 EA back to backend over WS.
+// Used by order handlers in the EA to report order_result / order_list.
+__declspec(dllexport) int __stdcall
+Bridge_WsSend(const wchar_t* msg_w)
+{
+    std::string msg = W2S(msg_w);
+    bool ok = WsSend(msg);
+    Log("Bridge_WsSend(" + std::to_string(msg.size()) + " bytes) ok=" + (ok?"1":"0"));
+    return ok ? 0 : -1;
 }
 
 } // extern "C"

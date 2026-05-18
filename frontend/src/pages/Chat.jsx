@@ -1,10 +1,12 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo, memo } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import ReactMarkdown from 'react-markdown'
+import { QRCodeSVG } from 'qrcode.react'
 import { verifyToken } from '../api'
 
 const CACHE_PREFIX = 'ai_bridge_session_'
 
+// ── Styles (defined outside component — no re-creation on each render) ────────
 const s = {
   root: {
     display: 'flex', flexDirection: 'column', height: '100vh',
@@ -103,6 +105,31 @@ const s = {
   confirmErr: {
     marginTop: 8, fontSize: 12, color: '#e11d48',
   },
+  qrBtn: {
+    marginLeft: 8, width: 32, height: 32, borderRadius: 8,
+    background: 'transparent', border: '1px solid #e2e8f0',
+    cursor: 'pointer', display: 'flex', alignItems: 'center',
+    justifyContent: 'center', color: '#64748b', flexShrink: 0,
+    transition: 'background .15s',
+  },
+  qrOverlay: {
+    position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)',
+    display: 'flex', alignItems: 'center', justifyContent: 'center',
+    zIndex: 1000,
+  },
+  qrModal: {
+    background: '#fff', borderRadius: 20, padding: '28px 32px',
+    display: 'flex', flexDirection: 'column', alignItems: 'center',
+    gap: 16, boxShadow: '0 8px 40px rgba(0,0,0,0.18)',
+    maxWidth: 320, width: '90%',
+  },
+  qrTitle: { fontSize: 15, fontWeight: 600, color: '#1e293b' },
+  qrSub:   { fontSize: 12, color: '#94a3b8', textAlign: 'center', lineHeight: 1.5 },
+  qrClose: {
+    marginTop: 4, padding: '8px 28px', borderRadius: 10,
+    background: '#2563eb', border: 'none', color: '#fff',
+    fontSize: 14, fontWeight: 600, cursor: 'pointer',
+  },
 }
 
 const BOUNCE_STYLE = `
@@ -118,12 +145,91 @@ const BOUNCE_STYLE = `
   *    { box-sizing: border-box; }
 `
 
+// ── Memoized message bubble — only re-renders when content changes ────────────
+const MessageBubble = memo(function MessageBubble({ m }) {
+  return (
+    <div>
+      <div style={s.role(m.role)}>
+        {m.role === 'user' ? 'You' : 'AI Assistant'}
+      </div>
+      <div style={s.bubble(m.role)}>
+        <MarkdownSafe>{m.content}</MarkdownSafe>
+      </div>
+    </div>
+  )
+})
+
+// ── ReactMarkdown with error boundary ────────────────────────────────────────
+function MarkdownSafe({ children }) {
+  try {
+    return <ReactMarkdown>{children}</ReactMarkdown>
+  } catch {
+    return <span style={{ whiteSpace: 'pre-wrap' }}>{children}</span>
+  }
+}
+
+// ── Memoized QR code — chatUrl never changes after mount ─────────────────────
+const QrCode = memo(function QrCode({ url }) {
+  return <QRCodeSVG value={url} size={200} level="M" />
+})
+
+function getGreeting() {
+  const lang = (navigator.language || 'en').toLowerCase()
+  const l = lang.slice(0, 2)
+  const greetings = {
+    vi: ['👋 Xin chào! Tôi là **AI Strategy Manager** của bạn.',
+         'Tôi có thể giúp bạn **thêm, sửa, xóa** các Trading Strategy trên MT4.',
+         '*Ví dụ: "Thêm strategy mua EURUSD khi MA20 cắt lên MA50"*'],
+    zh: ['👋 你好！我是你的 **AI Strategy Manager**。',
+         '我可以帮你在 MT4 上**添加、修改、删除**交易策略。',
+         '*例如："当MA20上穿MA50时买入EURUSD"*'],
+    ja: ['👋 こんにちは！**AI Strategy Manager** です。',
+         'MT4 の取引戦略を**追加・変更・削除**するお手伝いをします。',
+         '*例：「MA20がMA50を上抜けたらEURUSDを買う」*'],
+    ko: ['👋 안녕하세요! **AI Strategy Manager**입니다.',
+         'MT4에서 트레이딩 전략을 **추가·수정·삭제**해 드립니다.',
+         '*예: "MA20이 MA50을 상향 돌파할 때 EURUSD 매수"*'],
+    es: ['👋 ¡Hola! Soy tu **AI Strategy Manager**.',
+         'Puedo ayudarte a **añadir, editar y eliminar** estrategias en MT4.',
+         '*Ejemplo: "Comprar EURUSD cuando MA20 cruce sobre MA50"*'],
+    fr: ['👋 Bonjour ! Je suis votre **AI Strategy Manager**.',
+         'Je peux vous aider à **ajouter, modifier et supprimer** des stratégies sur MT4.',
+         '*Exemple : "Acheter EURUSD quand MA20 croise MA50 à la hausse"*'],
+    de: ['👋 Hallo! Ich bin Ihr **AI Strategy Manager**.',
+         'Ich helfe Ihnen beim **Hinzufügen, Bearbeiten und Löschen** von Strategien in MT4.',
+         '*Beispiel: „EURUSD kaufen, wenn MA20 MA50 nach oben kreuzt"*'],
+    pt: ['👋 Olá! Sou o seu **AI Strategy Manager**.',
+         'Posso ajudá-lo a **adicionar, editar e remover** estratégias no MT4.',
+         '*Exemplo: "Comprar EURUSD quando MA20 cruzar acima de MA50"*'],
+    th: ['👋 สวัสดี! ฉันคือ **AI Strategy Manager** ของคุณ',
+         'ฉันช่วยคุณ**เพิ่ม แก้ไข และลบ**กลยุทธ์การเทรดบน MT4 ได้',
+         '*ตัวอย่าง: "ซื้อ EURUSD เมื่อ MA20 ตัดขึ้นเหนือ MA50"*'],
+    id: ['👋 Halo! Saya adalah **AI Strategy Manager** Anda.',
+         'Saya dapat membantu Anda **menambah, mengedit, dan menghapus** strategi di MT4.',
+         '*Contoh: "Beli EURUSD ketika MA20 memotong MA50 ke atas"*'],
+    ar: ['👋 مرحباً! أنا **AI Strategy Manager** الخاص بك.',
+         'يمكنني مساعدتك في **إضافة وتعديل وحذف** استراتيجيات التداول على MT4.',
+         '*مثال: "اشتر EURUSD عندما يتقاطع MA20 فوق MA50"*'],
+    ru: ['👋 Привет! Я ваш **AI Strategy Manager**.',
+         'Я помогу вам **добавлять, изменять и удалять** торговые стратегии в MT4.',
+         '*Пример: «Купить EURUSD, когда MA20 пересечёт MA50 снизу вверх»*'],
+  }
+  const t = greetings[l] || [
+    '👋 Hello! I\'m your **AI Strategy Manager**.',
+    'I can help you **add, update and delete** trading strategies on MT4.',
+    '*Example: "Buy EURUSD when MA20 crosses above MA50"*',
+  ]
+  return t.join('\n\n')
+}
+
+// ── Chat URL is stable — compute once at module level ────────────────────────
+const CHAT_URL = window.location.href
+
 export default function Chat() {
   const [params]   = useSearchParams()
   const token      = params.get('token') || ''
   const cacheKey   = CACHE_PREFIX + token
 
-  // status: verifying | confirm | ok | error
   const [status, setStatus]       = useState('verifying')
   const [userInfo, setUserInfo]   = useState(null)
   const [messages, setMessages]   = useState([])
@@ -133,8 +239,10 @@ export default function Chat() {
   const [accInput, setAccInput]   = useState('')
   const [accError, setAccError]   = useState('')
   const [wsOnline, setWsOnline]   = useState(false)
+  const [showQr, setShowQr]       = useState(false)
   const bottomRef                 = useRef(null)
   const wsRef                     = useRef(null)
+  const scrollRafRef              = useRef(null)
 
   // ── Verify token on mount ────────────────────────────────────────────
   useEffect(() => {
@@ -143,7 +251,8 @@ export default function Chat() {
     verifyToken(token)
       .then(r => {
         setUserInfo(r.data)
-        const cached = localStorage.getItem(cacheKey)
+        let cached
+        try { cached = localStorage.getItem(cacheKey) } catch { cached = null }
         if (cached === String(r.data.account_number)) {
           enterChat(r.data)
         } else {
@@ -156,7 +265,7 @@ export default function Chat() {
       })
   }, [token])
 
-  // ── WebSocket connection (opened when status becomes 'ok') ───────────
+  // ── WebSocket connection ─────────────────────────────────────────────
   useEffect(() => {
     if (status !== 'ok' || !userInfo) return
 
@@ -175,7 +284,6 @@ export default function Chat() {
           setMessages(m => [...m, { role: 'assistant', content: data.reply }])
           setLoading(false)
         }
-        // strategy_list / strategy_update / strategy_delete could update a sidebar in future
       } catch {
         // ignore malformed frames
       }
@@ -202,7 +310,7 @@ export default function Chat() {
     }
   }, [status, userInfo])
 
-  const enterChat = (info) => {
+  const enterChat = useCallback((info) => {
     setStatus('ok')
     const activeDate = info.active_date
       ? new Date(info.active_date).toLocaleDateString('en-GB')
@@ -210,37 +318,40 @@ export default function Chat() {
     setMessages([{
       role: 'assistant',
       content: [
-        `👋 Xin chào! Tôi là **AI Strategy Manager** của bạn.`,
+        getGreeting(),
         ``,
         `Account: **${info.account_number}** | Server: **${info.server_broker}** | License: **${info.license_type}**${activeDate ? ` | Active: **${activeDate}**` : ''}`,
-        ``,
-        `Tôi có thể giúp bạn **thêm, sửa, xóa** các Trading Strategy trên MT4.`,
-        `Ví dụ: *"Thêm strategy mua EURUSD khi MA20 cắt lên MA50"*`,
       ].join('\n'),
     }])
-  }
+  }, [])
 
   // ── Account number confirmation ──────────────────────────────────────
-  const confirmAccount = () => {
+  const confirmAccount = useCallback(() => {
     if (String(accInput.trim()) === String(userInfo.account_number)) {
-      localStorage.setItem(cacheKey, String(userInfo.account_number))
+      try { localStorage.setItem(cacheKey, String(userInfo.account_number)) } catch { }
       enterChat(userInfo)
     } else {
       setAccError('Incorrect account number. Please try again.')
     }
-  }
+  }, [accInput, userInfo, cacheKey, enterChat])
 
-  const onAccKey = (e) => {
+  const onAccKey = useCallback((e) => {
     if (e.key === 'Enter') confirmAccount()
-  }
+  }, [confirmAccount])
 
-  // ── Auto-scroll ──────────────────────────────────────────────────────
+  // ── Auto-scroll — debounced via requestAnimationFrame ───────────────
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+    if (scrollRafRef.current) cancelAnimationFrame(scrollRafRef.current)
+    scrollRafRef.current = requestAnimationFrame(() => {
+      bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+    })
+    return () => {
+      if (scrollRafRef.current) cancelAnimationFrame(scrollRafRef.current)
+    }
   }, [messages, loading])
 
   // ── Send message via WebSocket ───────────────────────────────────────
-  const send = () => {
+  const send = useCallback(() => {
     const text = input.trim()
     if (!text || loading) return
 
@@ -248,7 +359,7 @@ export default function Chat() {
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       setMessages(m => [...m, {
         role: 'assistant',
-        content: '⚠️ Mất kết nối. Vui lòng tải lại trang.',
+        content: '⚠️ Connection lost. Please refresh the page.',
       }])
       return
     }
@@ -257,11 +368,15 @@ export default function Chat() {
     setMessages(m => [...m, { role: 'user', content: text }])
     setLoading(true)
     ws.send(JSON.stringify({ event: 'chat_message', message: text }))
-  }
+  }, [input, loading])
 
-  const onKey = (e) => {
+  const onKey = useCallback((e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() }
-  }
+  }, [send])
+
+  const onInputChange = useCallback((e) => setInput(e.target.value), [])
+  const openQr  = useCallback(() => setShowQr(true),  [])
+  const closeQr = useCallback(() => setShowQr(false), [])
 
   // ── States ───────────────────────────────────────────────────────────
   if (status === 'verifying') return (
@@ -315,6 +430,19 @@ export default function Chat() {
   return (
     <>
       <style>{BOUNCE_STYLE}</style>
+
+      {/* QR Modal */}
+      {showQr && (
+        <div style={s.qrOverlay} onClick={closeQr}>
+          <div style={s.qrModal} onClick={e => e.stopPropagation()}>
+            <div style={s.qrTitle}>📱 Open on Mobile</div>
+            <QrCode url={CHAT_URL} />
+            <div style={s.qrSub}>Scan this QR code to open the chat on your phone</div>
+            <button style={s.qrClose} onClick={closeQr}>Close</button>
+          </div>
+        </div>
+      )}
+
       <div style={s.root}>
         {/* Header */}
         <div style={s.header}>
@@ -323,19 +451,26 @@ export default function Chat() {
           <span style={s.sub}>
             #{userInfo?.account_number} · {userInfo?.license_type}
           </span>
+          <button style={s.qrBtn} onClick={openQr} title="Open on mobile">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <rect x="3" y="3" width="7" height="7" rx="1"/>
+              <rect x="14" y="3" width="7" height="7" rx="1"/>
+              <rect x="3" y="14" width="7" height="7" rx="1"/>
+              <rect x="14" y="14" width="3" height="3" rx="0.5"/>
+              <rect x="19" y="14" width="2" height="2" rx="0.5"/>
+              <rect x="14" y="19" width="2" height="2" rx="0.5"/>
+              <rect x="18" y="18" width="3" height="3" rx="0.5"/>
+            </svg>
+          </button>
+          <span style={{ fontSize: 11, color: '#94a3b8', whiteSpace: 'nowrap' }}>
+            Open on mobile
+          </span>
         </div>
 
         {/* Messages */}
         <div style={s.messages}>
           {messages.map((m, i) => (
-            <div key={i}>
-              <div style={s.role(m.role)}>
-                {m.role === 'user' ? 'You' : 'AI Assistant'}
-              </div>
-              <div style={s.bubble(m.role)}>
-                <ReactMarkdown>{m.content}</ReactMarkdown>
-              </div>
-            </div>
+            <MessageBubble key={i} m={m} />
           ))}
 
           {loading && (
@@ -356,7 +491,7 @@ export default function Chat() {
             rows={1}
             placeholder="Thêm / sửa / xóa strategy... (VD: thêm strategy mua EURUSD khi RSI < 30)"
             value={input}
-            onChange={e => setInput(e.target.value)}
+            onChange={onInputChange}
             onKeyDown={onKey}
           />
           <button style={s.sendBtn(disabled)} onClick={send} disabled={disabled}>

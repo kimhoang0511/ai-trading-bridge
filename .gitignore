@@ -36,6 +36,12 @@ logs/
 *.o
 *.obj
 
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
 # Secrets / config
 .env
 *.env.local

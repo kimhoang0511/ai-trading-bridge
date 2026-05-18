@@ -52,9 +52,17 @@ _STALE_TTL    = 3600            # evict accounts idle for >1 hour
 
 _claude: "anthropic.AsyncAnthropic | None" = None
 
-VALID_OPS  = {"add", "update", "delete"}
-VALID_SID  = range(0, 5)        # slots 0-4
-VALID_TFS  = {0, 1, 5, 15, 30, 60, 240, 1440, 10080}
+VALID_OPS        = {"add", "update", "delete"}
+VALID_ORDER_OPS  = {"order_open", "order_close", "order_close_all", "order_modify", "order_list",
+                    "order_history_last", "order_history_48h", "market_query"}
+VALID_SID        = range(0, 5)        # slots 0-4
+VALID_TFS        = {0, 1, 5, 15, 30, 60, 240, 1440, 10080}
+CHAT_ORDER_MAGIC = 20250518           # magic number for chat-opened orders
+
+_ea_pending: dict = {}                # account_number → asyncio.Future (order request/response)
+_account_locks: dict = {}             # account_number → asyncio.Lock (prevent concurrent CRUD)
+_context_cache: dict = {}             # account_number → (version_key, context_str)
+_WS_MSG_MAX_BYTES = 65_536            # 64 KB hard limit per WS message
 
 
 def _conv_get(account: str) -> list:
@@ -69,30 +77,49 @@ def _conv_append(account: str, role: str, content: str) -> None:
     _last_activity[account] = time.time()
 
 
+def _conv_update_last_assistant(account: str, new_content: str) -> None:
+    """Replace the most recent assistant message in history (used after order execution)."""
+    hist = _conv_store.get(account, [])
+    for i in range(len(hist) - 1, -1, -1):
+        if hist[i]["role"] == "assistant":
+            hist[i]["content"] = new_content
+            return
+
+
 def _strategy_store_save(account: str, sid: int, data: dict) -> None:
     strategy_store.setdefault(account, {})[sid] = data
+    _context_cache.pop(account, None)
 
 
 def _strategy_store_delete(account: str, sid: int) -> None:
     strategy_store.get(account, {}).pop(sid, None)
+    _context_cache.pop(account, None)
 
 
 def _strategy_context(account: str) -> str:
-    """Build a strategy summary string to inject into Claude's system prompt."""
+    """Build a strategy summary string to inject into Claude's system prompt (cached)."""
+    if account in _context_cache:
+        return _context_cache[account]
     ss = strategy_store.get(account, {})
     if not ss:
-        return "Current strategies in EA: none configured yet."
+        result = "Current strategies in EA: none configured yet."
+        _context_cache[account] = result
+        return result
     tf_map = {0:"auto",1:"M1",5:"M5",15:"M15",30:"M30",60:"H1",240:"H4",1440:"D1",10080:"W1"}
     lines = ["Current strategies in EA:"]
     for sid in sorted(ss):
-        s  = ss[sid]
-        tf = tf_map.get(int(s.get("tf", 0)), str(s.get("tf", 0)))
+        s       = ss[sid]
+        tf      = tf_map.get(int(s.get("tf", 0)), str(s.get("tf", 0)))
+        enabled = s.get("enabled", True)
+        status  = "ON" if enabled else "OFF"
         lines.append(
-            f"  S{sid+1} (sid={sid}): {s.get('action','?')} {s.get('symbol','?')} {tf}"
+            f"  S{sid+1} (sid={sid}) [{status}]: {s.get('action','?')} {s.get('symbol','?')} {tf}"
             f" | lot={s.get('lot',0.1)} SL={s.get('sl',50)} TP={s.get('tp',100)}"
             f" | prompt: \"{s.get('prompt','')[:80]}\""
         )
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    _context_cache[account] = result
+    return result
 
 
 def _rate_check(account: str) -> bool:
@@ -106,8 +133,12 @@ def _rate_check(account: str) -> bool:
     _rate_counters[account].append(now)
     return True
 
-CLAUDE_API_KEY  = os.getenv("CLAUDE_API_KEY", "")
-FRONTEND_URL    = os.getenv("FRONTEND_URL",  "http://192.168.21.1:3000")
+CLAUDE_API_KEY    = os.getenv("CLAUDE_API_KEY",    "")
+FRONTEND_URL      = os.getenv("FRONTEND_URL",     "http://192.168.21.1:3000")
+CLAUDE_CHAT_MODEL      = os.getenv("CLAUDE_CHAT_MODEL",      "claude-haiku-4-5")
+CLAUDE_PARSE_MODEL     = os.getenv("CLAUDE_PARSE_MODEL",     "claude-sonnet-4-6")
+CLAUDE_CHAT_MAX_TOKENS = int(os.getenv("CLAUDE_CHAT_MAX_TOKENS",  "512"))
+CLAUDE_PARSE_MAX_TOKENS= int(os.getenv("CLAUDE_PARSE_MAX_TOKENS", "2000"))
 
 app = FastAPI(title="AI Bridge License Server", version="1.0.0")
 
@@ -130,6 +161,12 @@ async def _cleanup_stale():
             strategy_store.pop(a, None)
             _rate_counters.pop(a, None)
             _last_activity.pop(a, None)
+            _context_cache.pop(a, None)
+            _account_locks.pop(a, None)
+        # Also prune _rate_counters keys for accounts that never appeared in _last_activity
+        for a in list(_rate_counters.keys()):
+            if a not in _last_activity:
+                _rate_counters.pop(a, None)
         if stale:
             logger.info(f"Evicted {len(stale)} stale accounts: {stale}")
 
@@ -277,7 +314,7 @@ def verify(token: str, db: Session = Depends(get_db)):
     try:
         payload = decode_token(token)
     except Exception:
-        return JSONResponse({"status": "error", "message": "Token không hợp lệ hoặc đã hết hạn"}, status_code=401)
+        return JSONResponse({"status": "error", "message": "Invalid or expired token"}, status_code=401)
 
     user = db.query(User).filter(
         User.account_number == payload["account_number"],
@@ -325,6 +362,13 @@ OUTPUT FORMAT (return ONLY valid JSON, no markdown, no explanation):
       ]},
       {"type":"CMP","left":"rsi14","op":"<","right":65}
     ]
+  },
+  "exit_condition": {
+    "type": "AND",
+    "args": [
+      {"type":"CMP","left":"ma20","op":"<","right":"ma50"},
+      {"type":"CMP","left":"ma20_prev","op":">","right":"ma50_prev"}
+    ]
   }
 }
 
@@ -361,12 +405,20 @@ CROSSOVER RULE: "X crosses above Y" requires BOTH current and _prev variants:
 
 CRITICAL RULES:
 1. If instruction mentions ANY indicator, add it to indicators array AND reference in condition.
-2. Each indicator name used in condition MUST appear in indicators array.
+2. Each indicator name used in condition or exit_condition MUST appear in indicators array.
 3. action: BUY or SELL only.
 4. symbol: extract from instruction, normalize to MT4 format (e.g. "gold"→"XAUUSD").
 5. tf: minutes (1,5,15,30,60,240,1440); 0 if not specified.
 6. sl_pip and tp_pip must be > 0; tp_pip >= sl_pip * 0.5.
-7. ohlc_bars: minimum bars needed (crossover=2, default=3)."""
+7. ohlc_bars: minimum bars needed (crossover=2, default=3).
+8. exit_condition: ALWAYS include this field. If the instruction mentions an explicit exit/close condition, parse it here using the same indicator variable names from indicators array. If no explicit exit is mentioned, infer a logical reversal: for a BUY entry using crossover X>Y, the exit is X<Y crossover. If no reversal can be inferred, output "exit_condition": {} (empty = rely on SL/TP only).
+9. MAX indicators: 15. If more are needed, keep only the most essential ones.
+10. Only use FN names from the PA FUNCTIONS list above. NEVER invent function names.
+11. UNSUPPORTED strategies: If the strategy requires something this system cannot model
+    (news/fundamentals, sentiment, ML predictions, custom/proprietary indicators, inter-symbol
+    correlation, order flow, or any condition not expressible as indicator CMP/FN logic),
+    output ONLY: {"action":"UNSUPPORTED","reason":"<one sentence English explanation>"}
+    Do NOT attempt to fake a condition for an unsupported strategy."""
 
 _FEW_SHOT_USER = ('Instruction: "Buy GBPUSD when EMA20 crosses above EMA50 and RSI14 < 70"\n'
                   'Symbol: GBPUSD\nDefault lot: 0.100000, SL: 40 pips, TP: 80 pips')
@@ -381,7 +433,10 @@ _FEW_SHOT_ASST = ('{"action":"BUY","tf":0,"lot":0.1,"sl_pip":40,"tp_pip":80,"ohl
                   '{"type":"AND","args":['
                   '{"type":"CMP","left":"ema20","op":">","right":"ema50"},'
                   '{"type":"CMP","left":"ema20_prev","op":"<","right":"ema50_prev"}]},'
-                  '{"type":"CMP","left":"rsi14","op":"<","right":70}]}}')
+                  '{"type":"CMP","left":"rsi14","op":"<","right":70}]},'
+                  '"exit_condition":{"type":"AND","args":['
+                  '{"type":"CMP","left":"ema20","op":"<","right":"ema50"},'
+                  '{"type":"CMP","left":"ema20_prev","op":">","right":"ema50_prev"}]}}')
 _FEW_SHOT_USER2 = ('Instruction: "Sell USDJPY H4 when MACD crosses below signal and Stochastic > 80. SL 30, TP 60"\n'
                    'Symbol: USDJPY\nDefault lot: 0.100000, SL: 30 pips, TP: 60 pips')
 _FEW_SHOT_ASST2 = ('{"action":"SELL","tf":240,"lot":0.1,"sl_pip":30,"tp_pip":60,"ohlc_bars":2,'
@@ -395,7 +450,10 @@ _FEW_SHOT_ASST2 = ('{"action":"SELL","tf":240,"lot":0.1,"sl_pip":30,"tp_pip":60,
                    '{"type":"AND","args":['
                    '{"type":"CMP","left":"macd_main","op":"<","right":"macd_sig"},'
                    '{"type":"CMP","left":"macd_main_prev","op":">","right":"macd_sig_prev"}]},'
-                   '{"type":"CMP","left":"sto_main","op":">","right":80}]}}')
+                   '{"type":"CMP","left":"sto_main","op":">","right":80}]},'
+                   '"exit_condition":{"type":"AND","args":['
+                   '{"type":"CMP","left":"macd_main","op":">","right":"macd_sig"},'
+                   '{"type":"CMP","left":"macd_main_prev","op":"<","right":"macd_sig_prev"}]}}')
 
 async def _call_init_claude(
     prompt: str,
@@ -415,9 +473,10 @@ async def _call_init_claude(
     try:
         resp = await asyncio.wait_for(
             _claude.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=2000,
-                system=INIT_SYSTEM_PROMPT,
+                model=CLAUDE_PARSE_MODEL,
+                max_tokens=CLAUDE_PARSE_MAX_TOKENS,
+                system=[{"type": "text", "text": INIT_SYSTEM_PROMPT,
+                          "cache_control": {"type": "ephemeral"}}],
                 messages=[
                     {"role": "user",      "content": _FEW_SHOT_USER},
                     {"role": "assistant", "content": _FEW_SHOT_ASST},
@@ -439,6 +498,105 @@ async def _call_init_claude(
     except Exception as ex:
         logger.error(f"_call_init_claude error: {ex}")
         return None
+
+
+_SUPPORTED_FN: frozenset = frozenset({
+    # single-candle
+    "is_bull", "is_bear", "is_doji", "is_marubozu",
+    "is_hammer", "is_inverted_hammer", "is_shooting_star", "is_hanging_man",
+    "is_pin_bar_bull", "is_pin_bar_bear", "is_pin_bar", "is_spinning_top",
+    # two-candle
+    "is_bull_engulfing", "is_bear_engulfing",
+    "is_bull_harami",   "is_bear_harami",
+    "is_piercing",      "is_dark_cloud",
+    "is_tweezer_top",   "is_tweezer_bottom",
+    # three-candle
+    "is_morning_star",        "is_evening_star",
+    "is_three_white_soldiers","is_three_black_crows",
+    "is_three_inside_up",     "is_three_inside_down",
+    # market structure
+    "is_higher_high", "is_lower_low", "is_higher_low", "is_lower_high",
+    "is_uptrend",     "is_downtrend", "is_consolidating",
+    "is_bull_breakout","is_bear_breakout",
+    "is_high_volume",  "is_accelerating_up", "is_accelerating_down",
+    "near_round_number",
+})
+
+_MAX_INDICATORS = 15
+
+
+def _collect_condition_vars(node: dict, out: set) -> None:
+    """Recursively collect all indicator variable names referenced in a condition tree."""
+    if not isinstance(node, dict):
+        return
+    t = node.get("type", "")
+    if t == "CMP":
+        for side in ("left", "right"):
+            v = node.get(side)
+            if isinstance(v, str):
+                out.add(v)
+    elif t in ("AND", "OR"):
+        for child in node.get("args", []):
+            _collect_condition_vars(child, out)
+    elif t == "NOT":
+        _collect_condition_vars(node.get("arg", {}), out)
+
+
+def _collect_fn_names(node: dict, out: set) -> None:
+    """Recursively collect all FN names used in a condition tree."""
+    if not isinstance(node, dict):
+        return
+    t = node.get("type", "")
+    if t == "FN":
+        name = node.get("name", "")
+        if name:
+            out.add(name)
+    elif t in ("AND", "OR"):
+        for child in node.get("args", []):
+            _collect_fn_names(child, out)
+    elif t == "NOT":
+        _collect_fn_names(node.get("arg", {}), out)
+
+
+def _validate_strategy_config(config: dict) -> "tuple[bool, str]":
+    """Validate a config dict returned by _call_init_claude.
+    Returns (ok, error_code). error_code is machine-readable English —
+    callers must NOT display it directly; inject into history for Claude to explain.
+    """
+    action = config.get("action", "")
+    if action not in ("BUY", "SELL"):
+        return False, "missing_action:expected BUY or SELL"
+
+    cond = config.get("condition", {})
+    if not isinstance(cond, dict) or not cond.get("type"):
+        return False, "missing_condition:no technical entry condition found"
+
+    indicators = config.get("indicators", [])
+    if len(indicators) > _MAX_INDICATORS:
+        return False, f"too_many_indicators:{len(indicators)}>max={_MAX_INDICATORS}"
+
+    ind_names = {ind.get("name") for ind in indicators if ind.get("name")}
+    exit_cond = config.get("exit_condition", {})
+
+    # Check all CMP vars are declared in indicators
+    used_vars: set = set()
+    _collect_condition_vars(cond, used_vars)
+    if isinstance(exit_cond, dict) and exit_cond.get("type"):
+        _collect_condition_vars(exit_cond, used_vars)
+    missing_ind = used_vars - ind_names
+    if missing_ind:
+        return False, f"unknown_indicators:{','.join(sorted(missing_ind))}"
+
+    # Check all FN names are supported by DLL
+    used_fns: set = set()
+    _collect_fn_names(cond, used_fns)
+    if isinstance(exit_cond, dict) and exit_cond.get("type"):
+        _collect_fn_names(exit_cond, used_fns)
+    unsupported_fns = used_fns - _SUPPORTED_FN
+    if unsupported_fns:
+        return False, f"unsupported_fn:{','.join(sorted(unsupported_fns))}"
+
+    return True, ""
 
 
 def _extract_execute(text: str) -> "dict | None":
@@ -471,6 +629,344 @@ def _strip_execute(text: str) -> str:
     """Remove the [EXECUTE:{...}] block from the user-visible reply."""
     pos = text.find("[EXECUTE:")
     return text[:pos].rstrip() if pos >= 0 else text
+
+
+_TF_MAP = {0:"auto",1:"M1",5:"M5",15:"M15",30:"M30",60:"H1",240:"H4",1440:"D1",10080:"W1"}
+
+def _format_strategy_summary(acct: str, sid: int, op: str, ea_connected: bool,
+                              old_values: "dict | None" = None) -> str:
+    """Return a formatted strategy card to append after a successful add/update/delete."""
+    slot_name = f"S{sid + 1}"
+    if op == "delete":
+        msg = f"✅ **{slot_name}** removed."
+        if not ea_connected:
+            msg += " ⚠️ EA not connected — will sync on reconnect."
+        return f"\n\n---\n{msg}"
+
+    s      = strategy_store.get(acct, {}).get(sid, {})
+    tf_new = _TF_MAP.get(int(s.get("tf", 0)), str(s.get("tf", 0)))
+    status = "✅" if ea_connected else "💾"
+    lines  = [f"{status} **{slot_name} – {s.get('action','?')} {s.get('symbol','?')} ({tf_new})**"]
+
+    if op == "update" and old_values:
+        old     = old_values
+        tf_old  = _TF_MAP.get(int(old.get("tf", 0)), str(old.get("tf", 0)))
+        changes = []
+        # enabled toggle
+        old_en, new_en = old.get("enabled", True), s.get("enabled", True)
+        if old_en != new_en:
+            changes.append(f"**Status:** {'ON' if old_en else 'OFF'} → **{'ON' if new_en else 'OFF'}**")
+        for field, label, suffix in [("lot", "Lot", ""), ("sl", "SL", " pip"), ("tp", "TP", " pip")]:
+            ov, nv = old.get(field), s.get(field)
+            if ov is not None and nv is not None and str(ov) != str(nv):
+                changes.append(f"**{label}:** {ov}{suffix} → **{nv}{suffix}**")
+        if tf_old != tf_new:
+            changes.append(f"**TF:** {tf_old} → **{tf_new}**")
+        if old.get("prompt") and old.get("prompt") != s.get("prompt"):
+            lines.append(f"• **Entry:** {s.get('prompt', '')}")
+        if changes:
+            lines.append("• " + " | ".join(changes))
+        else:
+            lines.append(f"• **Lot:** {s.get('lot', 0.1)} | **SL:** {s.get('sl', 50)} pip | **TP:** {s.get('tp', 100)} pip")
+    else:
+        lines.append(f"• **Entry:** {s.get('prompt', '')}")
+        lines.append(f"• **Lot:** {s.get('lot', 0.1)} | **SL:** {s.get('sl', 50)} pip | **TP:** {s.get('tp', 100)} pip")
+
+    if not ea_connected:
+        lines.append("⚠️ Strategy saved — will apply when EA reconnects.")
+    return "\n\n---\n" + "\n".join(lines)
+
+
+async def _ea_request(account: str, payload: dict, timeout: float = 8.0) -> "dict | None":
+    """Send a request to EA via WebSocket and wait for the response."""
+    import uuid as _uuid
+    if account not in ws_ea_clients:
+        return None
+    payload["request_id"] = _uuid.uuid4().hex[:8]
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+    _ea_pending[account] = fut
+    try:
+        await ws_ea_clients[account].send_json(payload)
+        return await asyncio.wait_for(asyncio.shield(fut), timeout=timeout)
+    except asyncio.TimeoutError:
+        return None
+    finally:
+        _ea_pending.pop(account, None)
+
+
+_MT4_ERRORS: dict = {
+    130: "SL/TP too close to market price (ERR_INVALID_STOPS) — increase SL/TP or check broker stop level",
+    131: "Invalid trade volume (ERR_INVALID_TRADE_VOLUME)",
+    132: "Market is closed (ERR_MARKET_CLOSED)",
+    133: "Trading is disabled (ERR_TRADE_DISABLED)",
+    134: "Not enough money (ERR_NOT_ENOUGH_MONEY)",
+    135: "Price changed (ERR_PRICE_CHANGED) — please retry",
+    136: "Off quotes (ERR_OFF_QUOTES) — please retry",
+    137: "Broker is busy (ERR_BROKER_BUSY) — please retry",
+    138: "Requote — please retry",
+    139: "Order is locked (ERR_ORDER_LOCKED)",
+    141: "Too many requests (ERR_TOO_MANY_REQUESTS) — please retry later",
+    145: "Modification denied — too close to market (ERR_TRADE_MODIFY_DENIED)",
+    146: "Trade context is busy (ERR_TRADE_CONTEXT_BUSY) — please retry",
+    148: "Too many open orders (ERR_TOO_MANY_ORDERS)",
+    4109: "Trade is not allowed on this account",
+}
+
+def _mt4_error_msg(err) -> str:
+    try:
+        code = int(err)
+        desc = _MT4_ERRORS.get(code, "")
+        return f"`{code}`" + (f" — {desc}" if desc else "")
+    except Exception:
+        return f"`{err}`"
+
+
+def _format_order_result(result: "dict | None", op: str) -> str:
+    if result is None:
+        return "\n\n---\n⚠️ EA timeout — no response received."
+    if not result.get("success", False):
+        err = result.get("error", "unknown")
+        return f"\n\n---\n❌ Order failed: {_mt4_error_msg(err)}"
+    if op == "order_open":
+        ticket = result.get("ticket", "?")
+        sym    = result.get("symbol", "")
+        typ    = result.get("type",   "")
+        lot    = result.get("lot",    0)
+        price  = result.get("open_price", 0)
+        return (f"\n\n---\n✅ **Order opened**\n"
+                f"• Ticket: **#{ticket}** | {typ} {sym}\n"
+                f"• Lot: {lot} | Open price: {price:.5f}")
+    if op == "order_close":
+        ticket = result.get("ticket", "?")
+        profit = result.get("profit", 0)
+        price  = result.get("close_price", 0)
+        sign   = "+" if profit >= 0 else ""
+        return (f"\n\n---\n✅ **Order #{ticket} closed**\n"
+                f"• Close price: {price:.5f} | P&L: **{sign}{profit:.2f}**")
+    if op == "order_close_all":
+        closed = result.get("closed", 0)
+        failed = result.get("failed", 0)
+        orders = result.get("orders", [])
+        msg    = f"\n\n---\n✅ **Closed {closed} order(s)**"
+        if failed:
+            msg += f" | ⚠️ {failed} failed"
+        total_pnl = 0.0
+        for o in orders:
+            ticket  = o.get("ticket", "?")
+            sym     = o.get("symbol", "")
+            typ     = o.get("type", "")
+            lot     = o.get("lot", 0)
+            price   = o.get("close_price", 0)
+            profit  = o.get("profit", 0)
+            total_pnl += profit
+            sign    = "+" if profit >= 0 else ""
+            msg += (f"\n• **#{ticket}** {typ} {sym} {lot}lot"
+                    f" | Close: {price:.5f} | P&L: **{sign}{profit:.2f}**")
+        if len(orders) > 1:
+            sign = "+" if total_pnl >= 0 else ""
+            msg += f"\n• **Total P&L: {sign}{total_pnl:.2f}**"
+        return msg
+    if op == "order_modify":
+        ticket  = result.get("ticket", "?")
+        old_sl  = result.get("old_sl", None)
+        old_tp  = result.get("old_tp", None)
+        sl      = result.get("sl",     None)
+        tp      = result.get("tp",     None)
+        def _fp(v): return f"{float(v):.5f}" if v is not None and float(v) != 0 else "—"
+        def _arrow(old, new):
+            o, n = _fp(old), _fp(new)
+            return f"{o} → **{n}**" if o != n else f"**{n}**"
+        return (f"\n\n---\n✅ **Order #{ticket} modified**\n"
+                f"• SL: {_arrow(old_sl, sl)} | TP: {_arrow(old_tp, tp)}")
+    return "\n\n---\n✅ Done"
+
+
+def _order_source(magic: int) -> str:
+    if magic == CHAT_ORDER_MAGIC:
+        return "Chat"
+    if 88800 <= magic <= 88804:
+        return f"S{magic - 88800 + 1}"
+    if magic == 0:
+        return "Manual"
+    return f"Ext(#{magic})"
+
+def _format_order_list(orders: list) -> str:
+    if not orders:
+        return "\n\n---\n📋 **No open orders.**"
+    lines = [f"\n\n---\n📋 **Open Orders ({len(orders)}):**"]
+    for i, o in enumerate(orders, 1):
+        typ       = o.get("type",       "?")
+        sym       = o.get("symbol",     "?")
+        ticket    = o.get("ticket",     "?")
+        lot       = o.get("lot",        0)
+        price     = o.get("open_price", 0)
+        profit    = o.get("profit",     0)
+        magic     = int(o.get("magic",  0))
+        open_time = int(o.get("open_time", 0))
+        sign      = "+" if profit >= 0 else ""
+        pnl_clr   = "+" if profit >= 0 else ""
+        source    = _order_source(magic)
+        time_str  = (datetime.fromtimestamp(open_time, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                     if open_time else "?")
+        sl        = float(o.get("sl", 0))
+        tp        = float(o.get("tp", 0))
+        sl_str    = f"{sl:.5f}" if sl else "—"
+        tp_str    = f"{tp:.5f}" if tp else "—"
+        lines.append(
+            f"\n**{i}. #{ticket}** — {typ} {sym}\n"
+            f"   • Lot: {lot} | Open: {price:.5f} | P&L: **{pnl_clr}{profit:.2f}**\n"
+            f"   • SL: {sl_str} | TP: {tp_str}\n"
+            f"   • Source: **{source}** | {time_str}"
+        )
+    return "\n".join(lines)
+
+
+def _format_order_history(orders: list, mode: str, limit: int = 0) -> str:
+    if not orders:
+        return "\n\n---\n📋 **No order history found.**"
+    title = f"Last {limit} orders" if mode == "last" else "Orders in last 48h"
+    lines = [f"\n\n---\n📜 **Order History — {title} ({len(orders)}):**"]
+    total_pnl = 0.0
+    _CLOSE_REASON_LABEL = {"SL": "🔴 SL hit", "TP": "🟢 TP hit", "SO": "💀 Stop out", "manual": "✋ Closed manually"}
+    _OPENER_LABEL = {"chat": "💬 Chat", "manual": "👤 Manual", "ext": "🔌 External"}
+
+    for i, o in enumerate(orders, 1):
+        typ          = o.get("type",         "?")
+        sym          = o.get("symbol",       "?")
+        ticket       = o.get("ticket",       "?")
+        lot          = o.get("lot",          0)
+        open_price   = float(o.get("open_price",  0))
+        close_price  = float(o.get("close_price", 0))
+        profit       = float(o.get("profit",      0))
+        swap         = float(o.get("swap",        0))
+        commission   = float(o.get("commission",  0))
+        open_time    = int(o.get("open_time",  0))
+        close_time   = int(o.get("close_time", 0))
+        magic        = int(o.get("magic",      0))
+        opener_raw   = o.get("opener", "")
+        close_reason = o.get("close_reason", "")
+        total_pnl   += profit
+        # Opener label: prefer EA-provided field, fall back to magic-derived
+        if opener_raw.startswith("S"):
+            opener_label = f"🤖 Strategy {opener_raw}"
+        elif opener_raw in _OPENER_LABEL:
+            opener_label = _OPENER_LABEL[opener_raw]
+        else:
+            opener_label = _order_source(magic)
+        closed_label = _CLOSE_REASON_LABEL.get(close_reason, f"✋ {close_reason}" if close_reason else "—")
+        sign         = "+" if profit >= 0 else ""
+        open_str     = (datetime.fromtimestamp(open_time,  tz=timezone.utc).strftime("%m/%d %H:%M")
+                        if open_time  else "?")
+        close_str    = (datetime.fromtimestamp(close_time, tz=timezone.utc).strftime("%m/%d %H:%M")
+                        if close_time else "?")
+        lines.append(
+            f"\n**{i}. #{ticket}** — {typ} {sym}\n"
+            f"   • Lot: {lot} | Open: {open_price:.5f} → Close: {close_price:.5f}\n"
+            f"   • P&L: **{sign}{profit:.2f}** | Swap: {swap:.2f} | Comm: {commission:.2f}\n"
+            f"   • Opened by: **{opener_label}** | Closed: **{closed_label}** | {open_str} → {close_str}"
+        )
+    sign = "+" if total_pnl >= 0 else ""
+    lines.append(f"\n**Total P&L: {sign}{total_pnl:.2f}**")
+    return "\n".join(lines)
+
+
+def _format_market_data(data: dict) -> str:
+    """Format EA market_data response into a compact text block for Claude to analyze."""
+    from datetime import datetime as _dt
+    symbol  = data.get("symbol", "?")
+    tf      = int(data.get("tf", 0))
+    tf_str  = _TF_MAP.get(tf, f"{tf}m")
+    ask     = float(data.get("ask", 0))
+    bid     = float(data.get("bid", 0))
+    spread  = float(data.get("spread", 0))
+    bars    = data.get("bars", [])
+    inds    = data.get("indicators", {})
+
+    lines = [f"Symbol: {symbol} | TF: {tf_str} | Ask: {ask:.5f} | Bid: {bid:.5f} | Spread: {spread:.1f} pip"]
+
+    if bars:
+        lines.append("OHLCV (i=0 is current/latest bar):")
+        for b in bars[:20]:
+            i   = b.get("i", 0)
+            t   = b.get("time", 0)
+            ts  = _dt.utcfromtimestamp(t).strftime("%Y-%m-%d %H:%M") if t else "?"
+            o, h, l, c = b.get("open",0), b.get("high",0), b.get("low",0), b.get("close",0)
+            vol = b.get("volume", 0)
+            lines.append(f"  [{i}] {ts}  O:{o:.5f}  H:{h:.5f}  L:{l:.5f}  C:{c:.5f}  V:{vol}")
+
+    if inds:
+        lines.append("Indicators (index = bar shift, 0=current):")
+        for name, values in inds.items():
+            if isinstance(values, list) and values:
+                vals = "  ".join(f"[{i}]{float(v):.5f}" for i, v in enumerate(values))
+                lines.append(f"  {name}: {vals}")
+
+    return "\n".join(lines)
+
+
+async def _handle_order_execute(action: dict, account: str) -> str:
+    """Dispatch an order_* op to the EA and return a formatted result string."""
+    op = action.get("op", "")
+    if account not in ws_ea_clients:
+        return "\n\n---\n⚠️ EA not connected — cannot execute order commands."
+
+    if op == "order_list":
+        result = await _ea_request(account, {"event": "order_list_request"})
+        if result is None:
+            return "\n\n---\n⚠️ `order_list_timeout`"
+        return _format_order_list(result.get("orders", []))
+
+    if op == "order_open":
+        result = await _ea_request(account, {
+            "event":  "order_open",
+            "symbol": action.get("symbol", "EURUSD"),
+            "type":   action.get("type",   "BUY"),
+            "lot":    float(action.get("lot", 0.1)),
+            "sl":     float(action.get("sl",  50)),
+            "tp":     float(action.get("tp",  100)),
+            "magic":  CHAT_ORDER_MAGIC,
+        })
+        return _format_order_result(result, op)
+
+    if op == "order_close":
+        result = await _ea_request(account, {
+            "event":  "order_close",
+            "ticket": int(action.get("ticket", 0)),
+        })
+        return _format_order_result(result, op)
+
+    if op == "order_close_all":
+        payload: dict = {"event": "order_close_all"}
+        if action.get("symbol"):
+            payload["symbol"] = action["symbol"]
+        result = await _ea_request(account, payload)
+        return _format_order_result(result, op)
+
+    if op == "order_modify":
+        result = await _ea_request(account, {
+            "event":  "order_modify",
+            "ticket": int(action.get("ticket", 0)),
+            "sl":     float(action.get("sl", 0)),
+            "tp":     float(action.get("tp", 0)),
+        })
+        return _format_order_result(result, op)
+
+    if op == "order_history_last":
+        limit = max(1, int(action.get("limit", 10)))
+        result = await _ea_request(account, {"event": "order_history_last_request", "limit": limit})
+        if result is None:
+            return "\n\n---\n⚠️ `order_history_timeout`"
+        return _format_order_history(result.get("orders", []), "last", limit)
+
+    if op == "order_history_48h":
+        result = await _ea_request(account, {"event": "order_history_48h_request"})
+        if result is None:
+            return "\n\n---\n⚠️ `order_history_timeout`"
+        return _format_order_history(result.get("orders", []), "48h")
+
+    # market_query is handled separately (needs second Claude call) — should not reach here
+    return "\n\n---\n⚠️ `unknown_order_op`"
 
 
 @app.post("/init")
@@ -551,34 +1047,58 @@ S1 (sid=0) · S2 (sid=1) · S3 (sid=2) · S4 (sid=3) · S5 (sid=4)
 **DELETE** — Remove a strategy from a slot:
   - sid only
 
+**ENABLE / DISABLE** — Toggle a strategy on or off (no confirmation needed):
+  - sid : target slot
+  - ON  : strategy resumes placing orders when conditions match
+  - OFF : strategy keeps running but will NOT place any orders (monitor only)
+
 **LIST** — Describe what each slot does (answer from conversation context)
 
 ## CONVERSATION RULES
 
-1. **TOPIC GUARD** — If the user's message is not about strategy CRUD, politely decline
-   in the user's own language and redirect to strategy management.
-   Do not answer the off-topic question.
+0. **CONCISE** — Keep every reply short and direct. Use 1–3 sentences for confirmations,
+   clarifications, and status updates. Only list details when the user explicitly asks.
+   Never repeat information the user already provided.
+
+1. **TOPIC GUARD** — You handle: strategy CRUD, manual orders, and live market data queries.
+   Politely decline anything else (general chat, news, fundamentals, predictions) in the user's
+   own language and redirect to what you can do. Do not answer off-topic questions.
 
 2. **COLLECT** — If required info is missing or ambiguous, ask ONE focused question.
    Do not ask multiple questions at once. Do not proceed until the answer is clear.
 
-3. **CONFIRM** — Before executing ADD/UPDATE/DELETE, show a clear summary and ask:
-   "Xác nhận?" / "Confirm?" — wait for explicit approval before emitting [EXECUTE].
+3. **CONFIRM** — Before executing ADD/UPDATE/DELETE (or any order OPEN/CLOSE/MODIFY),
+   show a clear summary and ask "Confirm?" (in the user's language) in one reply, then STOP.
+   Wait for the user's next message before emitting [EXECUTE].
+   NEVER simulate, anticipate, or write the user's confirmation yourself ("User: yes", etc.).
+   Even if the user says "immediately", "right now", "сейчас", "ahora", or any urgency word — still confirm first.
 
 4. **EXECUTE** — Only append [EXECUTE] AFTER the user explicitly confirms with:
-   yes / đồng ý / confirm / ok / xác nhận / chắc chắn / sure / proceed
+   yes / confirm / ok / sure / proceed / да / 是 / sí / sim / oui
+   One [EXECUTE] per reply, never in the same reply as the confirmation question.
 
 5. **LANGUAGE** — Always detect and reply in the same language the user writes in.
-   Supported: Vietnamese, English, Chinese (Simplified/Traditional), Japanese, Korean,
-   Spanish, French, German, Portuguese, Thai, Indonesian, Malay, Arabic, Russian, Italian.
-   If the language is unrecognized, default to English.
+   Accept any language. Do NOT reject or redirect the user to another language.
 
 6. **PROMPT FIELD** — Always write the `prompt` value inside [EXECUTE] in clear English,
    regardless of what language the user typed in.
 
-7. **NO SUCCESS TEXT** — When you append [EXECUTE], do NOT write any success/confirmation
-   message in the reply body. Write ONLY a brief neutral closing line like
-   "Đang xử lý..." or "Processing..." — the system will inject the actual result status.
+7. **TEXT BEFORE [EXECUTE]** — The system strips [EXECUTE] and everything after it before
+   showing the reply to the user. Use this to your advantage:
+   - If there are MORE pending operations after this one, write the confirmation question
+     for the NEXT operation on the line(s) BEFORE [EXECUTE]. The user will see that
+     question along with the result of the current operation.
+   - If this is the LAST (or only) operation, write nothing — just emit [EXECUTE] alone.
+
+8. **ONE OPERATION PER TURN** — Emit exactly ONE [EXECUTE] per response. For multiple
+   requested operations, chain them: write the next confirmation question → then [EXECUTE]
+   for the current one. Never emit two or more [EXECUTE] in a single reply.
+
+   Example — user asks to delete S1, S2, S3:
+   Turn 1 (collecting): "Confirm delete S1?"
+   Turn 2 (user confirms S1, pre-ask S2): "Confirm delete S2? • Strategy: ..." [EXECUTE:delete S1]
+   Turn 3 (user confirms S2, pre-ask S3): "Confirm delete S3? • Strategy: ..." [EXECUTE:delete S2]
+   Turn 4 (user confirms S3, last op):    [EXECUTE:delete S3]
 
 ## [EXECUTE] FORMAT
 
@@ -587,6 +1107,8 @@ Append EXACTLY ONE of these at the very end of your reply (nothing after it):
   [EXECUTE:{"op":"add","sid":N,"prompt":"<English description>","lot":0.1,"sl":50,"tp":100,"tf":0}]
   [EXECUTE:{"op":"update","sid":N,"lot":0.2}]
   [EXECUTE:{"op":"update","sid":N,"prompt":"<new English description>","sl":30}]
+  [EXECUTE:{"op":"update","sid":N,"enabled":false}]
+  [EXECUTE:{"op":"update","sid":N,"enabled":true}]
   [EXECUTE:{"op":"delete","sid":N}]
 
 Rules:
@@ -596,21 +1118,222 @@ Rules:
 - "delete": only include sid
 - Do NOT wrap [EXECUTE] in markdown, quotes, or code blocks
 
+## ORDER MANAGEMENT
+
+Besides automated strategies, you can execute **manual trade orders** directly.
+
+**OPEN** — Place a new market order:
+  - symbol : instrument (e.g. EURUSD, XAUUSD); extract from user message
+  - type   : BUY or SELL
+  - lot    : lot size (default 0.10)
+  - sl     : stop loss in pips (default 50)
+  - tp     : take profit in pips (default 100)
+
+**CLOSE** — Close a specific order (ask for ticket if not provided):
+  - ticket : numeric order ticket
+
+**CLOSE ALL** — Close all chat-managed orders:
+  - symbol : optional instrument filter
+
+**MODIFY** — Change SL/TP of an existing order:
+  - ticket : numeric order ticket
+  - sl     : new SL in pips (omit to keep current)
+  - tp     : new TP in pips (omit to keep current)
+
+**LIST** — Show current open chat-managed orders (no confirmation needed):
+  - no parameters
+
+**HISTORY LAST N** — Show the last N closed orders (no confirmation needed):
+  - limit : number of orders to retrieve (e.g. 5, 10, 20)
+
+**HISTORY 48H** — Show all closed orders in the last 48 hours (no confirmation needed):
+  - no parameters
+
+Order [EXECUTE] formats:
+  [EXECUTE:{"op":"order_open","symbol":"EURUSD","type":"BUY","lot":0.1,"sl":50,"tp":100}]
+  [EXECUTE:{"op":"order_close","ticket":12345}]
+  [EXECUTE:{"op":"order_close_all"}]
+  [EXECUTE:{"op":"order_close_all","symbol":"EURUSD"}]
+  [EXECUTE:{"op":"order_modify","ticket":12345,"sl":30,"tp":150}]
+  [EXECUTE:{"op":"order_list"}]
+  [EXECUTE:{"op":"order_history_last","limit":10}]
+  [EXECUTE:{"op":"order_history_48h"}]
+
+Notes:
+- "Chat-managed orders" = orders opened through this chat (tracked by magic number).
+  You cannot close or modify orders opened automatically by EA strategies.
+- Confirm before OPEN / CLOSE / CLOSE ALL / MODIFY — same rules as strategy CRUD.
+- LIST, HISTORY LAST N, and HISTORY 48H do not require confirmation — emit [EXECUTE] immediately.
+- If user specifies a count ("last 10 orders", "последние 5 ордеров", "最近10笔", "últimas 10 órdenes") → use `order_history_last` with that limit.
+- If count is unspecified ("recent orders", "orders today", "история ордеров", "历史订单", "48h") → use `order_history_48h`.
+
+## MARKET DATA QUERY
+
+You can fetch live price and indicator data directly from MT4.
+
+**QUERY** — Get OHLCV bars and indicator values (no confirmation needed):
+  - symbol     : instrument, e.g. "EURUSD", "XAUUSD", "USDJPY"
+  - tf         : timeframe in minutes (1/5/15/30/60/240/1440)
+  - bars       : how many candles to fetch (1–50, default 5 for current; 1 for just latest price)
+  - indicators : list of indicators to compute (same format as strategy indicators)
+
+[EXECUTE] format:
+  [EXECUTE:{"op":"market_query","symbol":"EURUSD","tf":60,"bars":5,"indicators":[
+    {"name":"rsi14","type":"iRSI","period":14,"applied":0,"shift":0},
+    {"name":"ma20","type":"iMA","period":20,"method":1,"applied":0,"shift":0}
+  ]}]
+
+  For current price only (no indicators):
+  [EXECUTE:{"op":"market_query","symbol":"EURUSD","tf":60,"bars":1,"indicators":[]}]
+
+Indicator format rules: same as strategy indicators (iMA/iRSI/iMACD/iBands/iATR/iADX/iRSI/iCCI/iSAR/iStochastic/iWPR/iAlligator/iIchimoku/etc.)
+Use `"shift":0` for current bar, `"shift":1` for previous bar.
+For multi-bar indicator history, set `bars=N` — the system returns values at shifts 0..N-1 automatically.
+
+**Temporal mapping — translate time expressions to bar count + timeframe:**
+- "yesterday" / "hôm qua" / "вчера" / "ayer"          → tf=1440 (D1), bars=2
+- "last week" / "tuần trước" / "на прошлой неделе"     → tf=1440, bars=7
+- "last 3 days"                                         → tf=1440, bars=4
+- "this week so far"                                    → tf=1440, bars=5
+- "last hour"                                           → tf=60, bars=2
+- "last 4 hours"                                        → tf=240, bars=2
+- current price only                                    → bars=1
+
+Always map temporal questions to bar shifts. Never say you cannot fetch historical data — you can fetch up to 50 bars on any timeframe.
+
+## SYSTEM LIMITATIONS
+
+This system ONLY supports strategies expressible as:
+- Technical indicator comparisons (MA, RSI, MACD, Bollinger, Stochastic, CCI, ADX, ATR, SAR, Ichimoku, Alligator, Momentum, WPR)
+- Price action candle patterns (engulfing, hammer, doji, morning/evening star, etc.)
+- Market structure functions (uptrend, downtrend, breakout, consolidation)
+- Combinations of the above with AND/OR/NOT logic
+
+CANNOT support (decline gracefully in user's language, suggest a supported alternative):
+- News or fundamental-based conditions ("when Fed raises rates", "when NFP is released")
+- Sentiment or social media signals
+- Machine learning or AI price predictions
+- Custom/proprietary indicators not in the supported list
+- Inter-symbol correlation ("when gold rises, sell USD")
+- Order flow, volume profile, market depth, DOM
+- Any condition that cannot be expressed as indicator thresholds or candle patterns
+
+When declining, always: (1) explain what is unsupported, (2) suggest the closest supported alternative if one exists.
+
+## EVENT TAGS (injected by system — never write these yourself)
+
+After [EXECUTE], the system appends one of these tags to the conversation:
+- `[STRATEGY_EVENT:applied:<op>:<slot>]`           → operation succeeded, EA applied it
+- `[STRATEGY_EVENT:saved_not_applied:<op>:<slot>]` → saved but EA not connected
+- `[STRATEGY_EVENT:ea_error:<detail>]`             → EA returned an error
+- `[STRATEGY_ERROR:<code>]`                        → config validation failed
+
+When you see one of these tags in the history, explain the outcome to the user in their
+own language in a natural, friendly way. Do NOT expose the raw tag to the user.
+
+### ORDER RESULT EVENTS (injected by system after order execution)
+
+After an order [EXECUTE] is processed, the system replaces your reply with the MT4 result.
+In subsequent turns, your previous assistant message in history will contain the result text,
+for example:
+  "✅ **Order opened** • Ticket: **#12345** | BUY EURUSD ..."
+  "✅ **Order #12345 closed** • Close price: 1.08512 | P&L: **+12.50**"
+  "❌ Order failed: `ERR_REQUOTE`"
+  "⚠️ EA timeout — no response received."
+
+When you see such a result in history:
+- Refer to it naturally for PAST actions ("your order opened at ...", "the close succeeded")
+- If it shows a failure, offer to retry or suggest next steps
+- Do NOT re-emit [EXECUTE] for the same operation unless the user explicitly requests a retry
+
+**CRITICAL — live order queries:**
+When the user asks about CURRENT open orders — e.g.
+  EN: "show orders", "what orders do I have", "list orders", "open positions"
+  RU: "текущие ордера", "открытые позиции"
+  ZH: "当前订单", "持仓"
+  ES: "órdenes abiertas", "posiciones"
+  PT: "ordens abertas", "posições"
+— you MUST emit `[EXECUTE:{"op":"order_list"}]` immediately — do NOT answer from history.
+Order state (P&L, SL, TP) changes every tick; history is stale. No confirmation needed.
+
+**CRITICAL — order history queries:**
+When the user asks about PAST/CLOSED orders — e.g.
+  EN: "order history", "last 10 orders", "closed orders", "orders today"
+  RU: "история ордеров", "последние 10 ордеров"
+  ZH: "订单历史", "最近10笔"
+  ES: "historial de órdenes", "últimas 10 órdenes"
+  PT: "histórico de ordens", "últimas 10 ordens"
+— emit the appropriate [EXECUTE] immediately. Do NOT answer from history. Rules:
+- Specific count → `[EXECUTE:{"op":"order_history_last","limit":N}]`
+- Unspecified / "today" / "48h" → `[EXECUTE:{"op":"order_history_48h"}]`
+No confirmation needed.
+
+**CRITICAL — market data queries:**
+When the user asks about price, indicator values, candles, spread, or any live market data — e.g.
+  EN: "EURUSD price", "RSI14 H1", "MACD XAUUSD", "last H4 candle", "is market overbought", "current spread"
+  RU: "цена EURUSD", "RSI на H1", "текущая цена золота", "свечи H4"
+  ZH: "欧元美元价格", "RSI14 H1", "黄金当前价", "H4 K线"
+  ES: "precio EURUSD", "RSI14 en H1", "precio actual del oro"
+  PT: "preço EURUSD", "RSI14 H1", "preço atual do ouro"
+— ALWAYS emit market_query [EXECUTE] immediately. Do NOT make up values. Fetch live data first.
+No confirmation needed.
+
+**CRITICAL — live strategy queries:**
+When the user asks about current strategies — e.g.
+  EN: "list strategies", "what strategies are active", "show S1"
+  RU: "список стратегий", "активные стратегии"
+  ZH: "策略列表", "当前策略"
+  ES: "listar estrategias", "estrategias activas"
+— answer using ONLY the `## CURRENT EA STRATEGIES` context injected into the system prompt.
+It is always fresh. Do NOT reconstruct from conversation history.
+
+**CRITICAL — enable/disable (no confirmation needed):**
+When the user wants to disable a strategy — e.g.
+  EN: "disable S1", "turn off S2", "pause strategy 1", "stop S1 trading"
+  RU: "отключить S1", "выключить стратегию 1"
+  ZH: "关闭S1", "停用策略1"
+  ES: "desactivar S1", "pausar estrategia 1"
+→ emit `[EXECUTE:{"op":"update","sid":N,"enabled":false}]` immediately.
+When the user wants to enable — e.g.
+  EN: "enable S1", "turn on S2", "resume S1"
+  RU: "включить S1"  ZH: "启用S1"  ES: "activar S1"
+→ emit `[EXECUTE:{"op":"update","sid":N,"enabled":true}]` immediately.
+Do NOT ask for confirmation — this is a reversible toggle, not a destructive action.
+
+**For `applied` or `saved_not_applied` with op=`add` or op=`update`:**
+Reply with a success message AND a full summary of the strategy, formatted as:
+
+  ✅ [Slot] – [Direction] [Symbol] ([Timeframe])
+  • Entry : [entry condition from prompt, in user's language]
+  • Lot   : [lot] | SL: [sl] pip | TP: [tp] pip
+
+  (add "⚠️ EA not connected — strategy saved, will apply when EA reconnects." if saved_not_applied)
+
+**For op=`delete`:** brief confirmation only — no summary needed.
+
+Error codes for `[STRATEGY_ERROR:...]`:
+- `missing_action`               → direction (BUY/SELL) was not determinable
+- `missing_condition`            → no technical entry condition could be parsed
+- `unknown_indicators:<x>`       → indicator `x` was referenced but not declared
+- `unsupported_fn:<x>`           → PA function `x` is not supported by the system
+- `too_many_indicators:<n>>`     → strategy uses too many indicators (max 15)
+- `unsupported:<reason>`         → strategy requires unsupported features
+- `parse_failed`                 → config could not be generated
+
 ## EXAMPLES
 
-### Example A (Vietnamese — ADD, collecting info)
-User: thêm strategy mua gold khi RSI dưới 30
-Assistant: Bạn muốn thêm vào slot nào (S1–S5)?
+### Example A (English — ADD, collecting info)
+User: add strategy buy gold when RSI below 30
+Assistant: Which slot would you like to use (S1–S5)?
 
 User: S2
-Assistant: Xác nhận thêm Strategy **S2**?
-• Lệnh: **MUA XAUUSD** khi RSI(14) < 30
-• Lot: 0.10 | SL: 50 pip | TP: 100 pip | TF: tự động phát hiện
-Trả lời **"đồng ý"** để xác nhận.
+Assistant: Confirm add to **S2**?
+• Direction: **BUY XAUUSD** when RSI(14) < 30
+• Lot: 0.10 | SL: 50 pip | TP: 100 pip | TF: auto-detect
+Reply "yes" to confirm.
 
-User: đồng ý
-Assistant: Đang xử lý...
-[EXECUTE:{"op":"add","sid":1,"prompt":"Buy XAUUSD when RSI(14) is below 30","lot":0.10,"sl":50,"tp":100,"tf":0}]
+User: yes
+Assistant: [EXECUTE:{"op":"add","sid":1,"prompt":"Buy XAUUSD when RSI(14) is below 30","lot":0.10,"sl":50,"tp":100,"tf":0}]
 
 ### Example B (English — UPDATE)
 User: change S1 SL to 30 and lot to 0.2
@@ -620,27 +1343,37 @@ Assistant: Confirm update **S1**?
 Reply "yes" to confirm.
 
 User: yes
-Assistant: Processing...
-[EXECUTE:{"op":"update","sid":0,"sl":30,"lot":0.20}]
+Assistant: [EXECUTE:{"op":"update","sid":0,"sl":30,"lot":0.20}]
 
-### Example C (DELETE)
-User: xóa strategy 3
-Assistant: Xác nhận xóa **S3**? Strategy này sẽ bị deactivate ngay lập tức.
-Trả lời **"đồng ý"** để xác nhận.
+### Example C (market query — emit immediately, no confirmation)
+User: What is the current RSI14 on EURUSD H1?
+Assistant: [EXECUTE:{"op":"market_query","symbol":"EURUSD","tf":60,"bars":3,"indicators":[{"name":"rsi14","type":"iRSI","period":14,"applied":0,"shift":0}]}]
 
-User: đồng ý
-Assistant: Đang xử lý...
-[EXECUTE:{"op":"delete","sid":2}]
+User: цена XAUUSD сейчас?
+Assistant: [EXECUTE:{"op":"market_query","symbol":"XAUUSD","tf":60,"bars":1,"indicators":[]}]
 
-### Example D (off-topic — reply in user's language)
-User (Vietnamese): EURUSD hôm nay thế nào?
-Assistant: Xin lỗi, tôi chỉ hỗ trợ quản lý Strategy (thêm/sửa/xóa). Bạn muốn làm gì với strategy?
+User: 黄金现在多少钱？
+Assistant: [EXECUTE:{"op":"market_query","symbol":"XAUUSD","tf":60,"bars":1,"indicators":[]}]
 
-User (Chinese): 今天EURUSD怎么样？
-Assistant: 抱歉，我只支持交易策略管理（添加/修改/删除）。您想对策略做什么？
+### Example D (Russian — ADD)
+User: Добавить стратегию покупки EURUSD когда RSI ниже 30, слот S1
+Assistant: Подтвердите добавление в **S1**?
+• Направление: **BUY EURUSD** при RSI(14) < 30
+• Лот: 0.10 | SL: 50 пип | TP: 100 пип
+Ответьте "да" для подтверждения.
 
-User (Japanese): EURUSDは今日どうですか？
-Assistant: 申し訳ありませんが、私は取引戦略の管理（追加/編集/削除）のみをサポートしています。戦略について何をしたいですか？
+User: да
+Assistant: [EXECUTE:{"op":"add","sid":0,"prompt":"Buy EURUSD when RSI(14) is below 30","lot":0.10,"sl":50,"tp":100,"tf":0}]
+
+### Example E (off-topic — reply in user's language)
+User (English): What do you think about the Fed interest rate decision?
+Assistant: I can't provide macroeconomic analysis. I support: strategy management (add/update/delete), manual orders, and live market data queries (price, indicators). What would you like to do?
+
+User (Chinese): 你觉得美联储会加息吗？
+Assistant: 抱歉，我不支持宏观经济分析。我支持：策略管理（添加/修改/删除）、手动下单、实时行情查询。请问您需要什么帮助？
+
+User (Spanish): ¿Qué opinas del petróleo?
+Assistant: Lo siento, no ofrezco análisis fundamentales. Puedo ayudarte con: gestión de estrategias, órdenes manuales y consultas de datos de mercado en vivo. ¿En qué puedo ayudarte?
 """
 
 
@@ -687,16 +1420,28 @@ async def chat_message(request: Request, db: Session = Depends(get_db)):
     if not CLAUDE_API_KEY:
         return JSONResponse({"status": "error", "message": "Claude API key not configured"}, status_code=500)
 
+    # ── Per-account lock: prevent concurrent CRUD race conditions ─────────
+    lock = _account_locks.setdefault(user.account_number, asyncio.Lock())
+    async with lock:
+        return await _handle_chat_http(message, user)
+
+
+async def _handle_chat_http(message: str, user: "User") -> JSONResponse:
+    """Inner HTTP chat handler — runs inside per-account lock."""
     # ── Build multi-turn messages from server-side history ────────────────
     messages = _conv_get(user.account_number) + [{"role": "user", "content": message}]
 
     try:
         resp = await asyncio.wait_for(
             _claude.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=1024,
-                system=STRATEGY_SYSTEM_PROMPT + "\n\n## CURRENT EA STRATEGIES\n"
-                       + _strategy_context(user.account_number),
+                model=CLAUDE_CHAT_MODEL,
+                max_tokens=CLAUDE_CHAT_MAX_TOKENS,
+                system=[
+                    {"type": "text", "text": STRATEGY_SYSTEM_PROMPT,
+                     "cache_control": {"type": "ephemeral"}},
+                    {"type": "text", "text": "\n\n## CURRENT EA STRATEGIES\n"
+                                             + _strategy_context(user.account_number)},
+                ],
                 messages=messages,
             ),
             timeout=30.0,
@@ -719,19 +1464,68 @@ async def chat_message(request: Request, db: Session = Depends(get_db)):
     # ── Parse and execute CRUD action if present ─────────────────────────
     action = _extract_execute(reply)
     if action:
-        op  = action.get("op", "")
-        sid = int(action.get("sid", 0))
+        op = action.get("op", "")
 
-        # ── Validate [EXECUTE] fields ─────────────────────────────────────
-        if op not in VALID_OPS:
+        # ── Order ops (no sid required) ───────────────────────────────────
+        if op == "market_query":
+            reply = _strip_execute(reply)
+            acct  = user.account_number
+            mq_result = await _ea_request(acct, {
+                "event":      "market_query_request",
+                "symbol":     action.get("symbol", ""),
+                "tf":         int(action.get("tf", 60)),
+                "bars":       min(int(action.get("bars", 5)), 50),
+                "indicators": action.get("indicators", []),
+            }, timeout=10.0)
+            if mq_result is None:
+                reply += "\n\n---\n⚠️ `market_query_timeout` — EA did not respond."
+            else:
+                formatted = _format_market_data(mq_result)
+                # Second Claude call (Haiku — cheaper/faster for data summarization)
+                inject_msgs = _conv_get(acct) + [{
+                    "role": "user",
+                    "content": (
+                        f"[MARKET_DATA from MT4]\n{formatted}\n[/MARKET_DATA]\n"
+                        "Answer the user's question based on the data above. "
+                        "Be concise. Do NOT reproduce a raw table — "
+                        "summarize key values inline or as a short bullet list."
+                    ),
+                }]
+                try:
+                    resp2 = await asyncio.wait_for(
+                        _claude.messages.create(
+                            model="claude-haiku-4-5-20251001",
+                            max_tokens=CLAUDE_CHAT_MAX_TOKENS,
+                            system=STRATEGY_SYSTEM_PROMPT,
+                            messages=inject_msgs,
+                        ),
+                        timeout=20.0,
+                    )
+                    reply = resp2.content[0].text
+                except Exception:
+                    reply = formatted  # fallback: show raw data
+            _conv_update_last_assistant(acct, reply)
+            action = None
+
+        elif op in VALID_ORDER_OPS:
+            reply = _strip_execute(reply)
+            reply += await _handle_order_execute(action, user.account_number)
+            _conv_update_last_assistant(user.account_number, reply)
+            action = None  # mark as handled
+
+        else:
+            sid = int(action.get("sid", 0))
+
+        # ── Validate strategy [EXECUTE] fields ────────────────────────────
+        if action is not None and op not in VALID_OPS:
             logger.warning(f"CRUD blocked: invalid op={op!r} account={user.account_number}")
-            action = None  # drop silently — Claude misbehaved
+            action = None
 
-        elif sid not in VALID_SID:
+        elif action is not None and sid not in VALID_SID:
             logger.warning(f"CRUD blocked: sid={sid} out of range account={user.account_number}")
             action = None
 
-        elif op == "add":
+        elif action is not None and op == "add":
             raw_lot = action.get("lot", 0.1)
             raw_sl  = action.get("sl",  50)
             raw_tp  = action.get("tp",  100)
@@ -768,39 +1562,49 @@ async def chat_message(request: Request, db: Session = Depends(get_db)):
                 config = await _call_init_claude(prompt_str, lot=lot, sl=sl, tp=tp, tf=tf)
                 if config is None:
                     crud_result = "parse_error"
+                elif config.get("action") == "UNSUPPORTED":
+                    crud_result = "parse_error"
+                    crud_error  = f"unsupported:{config.get('reason', 'strategy too complex')}"
                 else:
-                    resolved_lot = config.get("lot",       lot)
-                    resolved_sl  = config.get("sl_pip",    sl)
-                    resolved_tp  = config.get("tp_pip",    tp)
-                    payload: dict = {
-                        "event": "strategy_add",
-                        "sid":   sid,
-                        "config": {
-                            "prompt":     prompt_str,
-                            "lot":        resolved_lot,
-                            "sl_pip":     resolved_sl,
-                            "sl":         resolved_sl,
-                            "tp_pip":     resolved_tp,
-                            "tp":         resolved_tp,
-                            "tf":         config.get("tf",        tf),
-                            "action":     config.get("action",    "BUY"),
-                            "symbol":     config.get("symbol",    ""),
-                            "ohlc_bars":  config.get("ohlc_bars", 3),
-                            "indicators": config.get("indicators", []),
-                            "condition":  config.get("condition",  {}),
+                    _ok, _reason = _validate_strategy_config(config)
+                    if not _ok:
+                        crud_result = "parse_error"
+                        crud_error  = _reason
+                    else:
+                        resolved_lot = config.get("lot",       lot)
+                        resolved_sl  = config.get("sl_pip",    sl)
+                        resolved_tp  = config.get("tp_pip",    tp)
+                        payload: dict = {
+                            "event": "strategy_add",
+                            "sid":   sid,
+                            "config": {
+                                "prompt":     prompt_str,
+                                "lot":        resolved_lot,
+                                "sl_pip":     resolved_sl,
+                                "sl":         resolved_sl,
+                                "tp_pip":     resolved_tp,
+                                "tp":         resolved_tp,
+                                "tf":         config.get("tf",        tf),
+                                "action":     config.get("action",    "BUY"),
+                                "symbol":     config.get("symbol",    ""),
+                                "ohlc_bars":  config.get("ohlc_bars", 3),
+                                "indicators":      config.get("indicators",      []),
+                                "condition":       config.get("condition",       {}),
+                                "exit_condition":  config.get("exit_condition",  {}),
+                            }
                         }
-                    }
-                    _strategy_store_save(acct, sid, {
-                        "prompt": prompt_str,
-                        "lot":    resolved_lot,
-                        "sl":     resolved_sl,
-                        "tp":     resolved_tp,
-                        "tf":     config.get("tf",     tf),
-                        "action": config.get("action", "BUY"),
-                        "symbol": config.get("symbol", ""),
-                    })
-                    await ws_broadcast(acct, payload)
-                    crud_result = "sent" if ea_connected else "no_ea"
+                        _strategy_store_save(acct, sid, {
+                            "prompt":  prompt_str,
+                            "lot":     resolved_lot,
+                            "sl":      resolved_sl,
+                            "tp":      resolved_tp,
+                            "tf":      config.get("tf",     tf),
+                            "action":  config.get("action", "BUY"),
+                            "symbol":  config.get("symbol", ""),
+                            "enabled": True,
+                        })
+                        await ws_broadcast(acct, payload)
+                        crud_result = "sent" if ea_connected else "no_ea"
 
             elif op == "update":
                 existing = strategy_store.get(acct, {}).get(sid, {})
@@ -817,48 +1621,62 @@ async def chat_message(request: Request, db: Session = Depends(get_db)):
                                                      tp=new_tp, tf=new_tf)
                     if config is None:
                         crud_result = "parse_error"
+                    elif config.get("action") == "UNSUPPORTED":
+                        crud_result = "parse_error"
+                        crud_error  = f"unsupported:{config.get('reason', 'strategy too complex')}"
                     else:
-                        resolved_lot = config.get("lot",    new_lot)
-                        resolved_sl  = config.get("sl_pip", new_sl)
-                        resolved_tp  = config.get("tp_pip", new_tp)
-                        payload = {
-                            "event": "strategy_add",
-                            "sid":   sid,
-                            "config": {
-                                "prompt":     new_prompt,
-                                "lot":        resolved_lot,
-                                "sl_pip":     resolved_sl,
-                                "sl":         resolved_sl,
-                                "tp_pip":     resolved_tp,
-                                "tp":         resolved_tp,
-                                "tf":         config.get("tf",        new_tf),
-                                "action":     config.get("action",    "BUY"),
-                                "symbol":     config.get("symbol",    new_sym),
-                                "ohlc_bars":  config.get("ohlc_bars", 3),
-                                "indicators": config.get("indicators", []),
-                                "condition":  config.get("condition",  {}),
+                        _ok, _reason = _validate_strategy_config(config)
+                        if not _ok:
+                            crud_result = "parse_error"
+                            crud_error  = _reason
+                        else:
+                            resolved_lot = config.get("lot",    new_lot)
+                            resolved_sl  = config.get("sl_pip", new_sl)
+                            resolved_tp  = config.get("tp_pip", new_tp)
+                            payload = {
+                                "event": "strategy_add",
+                                "sid":   sid,
+                                "config": {
+                                    "prompt":     new_prompt,
+                                    "lot":        resolved_lot,
+                                    "sl_pip":     resolved_sl,
+                                    "sl":         resolved_sl,
+                                    "tp_pip":     resolved_tp,
+                                    "tp":         resolved_tp,
+                                    "tf":         config.get("tf",        new_tf),
+                                    "action":     config.get("action",    "BUY"),
+                                    "symbol":     config.get("symbol",    new_sym),
+                                    "ohlc_bars":  config.get("ohlc_bars", 3),
+                                    "indicators":      config.get("indicators",      []),
+                                    "condition":       config.get("condition",       {}),
+                                    "exit_condition":  config.get("exit_condition",  {}),
+                                }
                             }
-                        }
-                        _strategy_store_save(acct, sid, {
-                            "prompt": new_prompt,
-                            "lot":    resolved_lot,
-                            "sl":     resolved_sl,
-                            "tp":     resolved_tp,
-                            "tf":     config.get("tf",     new_tf),
-                            "action": config.get("action", "BUY"),
-                            "symbol": config.get("symbol", new_sym),
-                        })
-                        await ws_broadcast(acct, payload)
-                        crud_result = "sent" if ea_connected else "no_ea"
+                            _strategy_store_save(acct, sid, {
+                                "prompt":  new_prompt,
+                                "lot":     resolved_lot,
+                                "sl":      resolved_sl,
+                                "tp":      resolved_tp,
+                                "tf":      config.get("tf",     new_tf),
+                                "action":  config.get("action", "BUY"),
+                                "symbol":  config.get("symbol", new_sym),
+                                "enabled": existing.get("enabled", True),
+                            })
+                            await ws_broadcast(acct, payload)
+                            crud_result = "sent" if ea_connected else "no_ea"
                 else:
-                    # Parameters only (lot/sl/tp/tf) → partial update, keep condition tree
+                    # Parameters only (lot/sl/tp/tf/enabled) → partial update
                     upd: dict = {"event": "strategy_update", "sid": sid}
+                    store_upd: dict = {}
                     for k in ("lot", "sl", "tp", "tf"):
                         if k in action:
                             upd[k] = action[k]
-                    _strategy_store_save(acct, sid, {**existing, **{
-                        k: upd[k] for k in ("lot", "sl", "tp", "tf") if k in upd
-                    }})
+                            store_upd[k] = action[k]
+                    if "enabled" in action:
+                        en = bool(action["enabled"])
+                        upd["enabled"] = 1 if en else 0   # EA reads as number
+                        store_upd["enabled"] = en
+                    _strategy_store_save(acct, sid, {**existing, **store_upd})
                     await ws_broadcast(acct, upd)
                     crud_result = "sent" if ea_connected else "no_ea"
 
@@ -879,34 +1697,20 @@ async def chat_message(request: Request, db: Session = Depends(get_db)):
         reply = _strip_execute(reply)
 
         if crud_result == "parse_error":
-            reply += (
-                "\n\n---\n"
-                "❌ **Lỗi:** Không thể phân tích strategy từ mô tả của bạn. "
-                "Vui lòng mô tả rõ hơn (instrument, hướng BUY/SELL, điều kiện vào lệnh) và thử lại."
-            )
+            error_code = crud_error or "parse_failed"
+            # Inject into history so Claude explains in the user's language next turn
+            _conv_append(user.account_number, "assistant",
+                         f"[STRATEGY_ERROR:{error_code}]")
+            reply += f"\n\n❌ `strategy_error:{error_code}`"
         elif crud_result == "error":
-            reply += (
-                f"\n\n---\n"
-                f"❌ **Lỗi khi gửi đến EA:** `{crud_error}`\n"
-                f"Vui lòng kiểm tra kết nối và thử lại."
-            )
+            tag = f"[STRATEGY_EVENT:ea_error:{crud_error}]"
+            _conv_append(user.account_number, "assistant", tag)
+            reply += f"\n\n❌ `ea_error:{crud_error}`"
         elif crud_result in ("no_ea", "sent"):
-            if crud_result == "no_ea":
-                op_vi = {"add": "thêm", "update": "cập nhật", "delete": "xóa"}.get(op, op)
-                reply += (
-                    f"\n\n---\n"
-                    f"⚠️ **EA chưa kết nối WebSocket** — lệnh {op_vi} đã ghi nhận nhưng chưa áp dụng vào MT4.\n"
-                    f"Khởi động lại EA để đồng bộ."
-                )
-            else:
-                slot_name = f"S{sid + 1}"
-                op_msg = {
-                    "add":    f"✅ **Strategy {slot_name} đã được áp dụng vào EA thành công!**",
-                    "update": f"✅ **Strategy {slot_name} đã được cập nhật thành công!**",
-                    "delete": f"✅ **Strategy {slot_name} đã bị xóa thành công!**",
-                }.get(op, "✅ **Thao tác thành công!**")
-                reply = reply or ""
-                reply += f"\n\n---\n{op_msg}"
+            reply += _format_strategy_summary(
+                user.account_number, sid, op, ea_connected=(crud_result == "sent"),
+                old_values=existing if op == "update" else None,
+            )
 
     logger.info(f"Chat {user.account_number}: {message[:50]}...")
     return {"status": "ok", "reply": reply}
@@ -959,21 +1763,44 @@ async def ws_ea_connect(
                 await ws.send_json({"event": "pong"})
 
             elif event == "strategy_hello":
-                # DLL sends all active sessions on connect — sync strategy_store
+                # DLL sends all active sessions on connect — merge into strategy_store
+                # Backend is source of truth: only fill slots not already stored
+                # (preserves chat-based lot/sl/tp modifications across EA restarts)
                 strategies = data.get("strategies", [])
+                existing_store = strategy_store.get(account_number, {})
                 for s in strategies:
                     sid = int(s.get("sid", -1))
-                    if 0 <= sid <= 4:
+                    if 0 <= sid <= 4 and sid not in existing_store:
                         _strategy_store_save(account_number, sid, {
-                            "prompt": s.get("prompt", ""),
-                            "lot":    s.get("lot",    0.1),
-                            "sl":     s.get("sl",     50),
-                            "tp":     s.get("tp",     100),
-                            "tf":     s.get("tf",     0),
-                            "action": s.get("action", "BUY"),
-                            "symbol": s.get("symbol", ""),
+                            "prompt":  s.get("prompt", ""),
+                            "lot":     s.get("lot",    0.1),
+                            "sl":      s.get("sl",     50),
+                            "tp":      s.get("tp",     100),
+                            "tf":      s.get("tf",     0),
+                            "action":  s.get("action", "BUY"),
+                            "symbol":  s.get("symbol", ""),
+                            "enabled": True,
                         })
                 logger.info(f"WS-EA strategy_hello: {len(strategies)} sessions for {account_number}")
+
+                # Push any stored parameter changes back to EA (lot/sl/tp/tf only —
+                # indicators stay as set by Bridge_Init; don't send prompt/symbol here)
+                ea_by_sid = {int(s.get("sid", -1)): s for s in strategies if 0 <= int(s.get("sid", -1)) <= 4}
+                current_store = strategy_store.get(account_number, {})
+                for sid, stored in current_store.items():
+                    ea = ea_by_sid.get(sid, {})
+                    upd: dict = {"event": "strategy_update", "sid": sid}
+                    for k in ("lot", "sl", "tp", "tf"):
+                        stored_v = stored.get(k)
+                        ea_v     = ea.get(k)
+                        if stored_v is not None and stored_v != ea_v:
+                            upd[k] = stored_v
+                    # Always sync enabled (EA resets to true on reconnect)
+                    stored_enabled = stored.get("enabled", True)
+                    upd["enabled"] = 1 if stored_enabled else 0
+                    await ws_ea_push(account_number, upd)
+                    logger.info(f"WS-EA re-sync S{sid+1}: {upd}")
+
                 # Forward live strategy list to frontend if connected
                 await ws_chat_push(account_number, {
                     "event":      "strategy_list",
@@ -998,48 +1825,59 @@ async def ws_ea_connect(
                     _strategy_store_delete(account_number, sid)
                     await ws_chat_push(account_number, {"event": "strategy_delete", "sid": sid})
 
+            elif event in ("order_result", "order_list", "order_history", "market_data"):
+                fut = _ea_pending.get(account_number)
+                if fut and not fut.done():
+                    fut.set_result(data)
+
     except WebSocketDisconnect:
         ws_ea_clients.pop(account_number, None)
+        # Cancel pending EA request so callers don't wait for the full timeout
+        fut = _ea_pending.pop(account_number, None)
+        if fut and not fut.done():
+            fut.cancel()
         logger.info(f"WS-EA disconnected: {account_number}")
 
 
 # ── Chat core — shared by HTTP and WebSocket handlers ─────────────────────────
 
 async def _handle_chat_ws(message: str, user: "User") -> str:
-    """Full chat pipeline: rate-limit → sanitize → Claude → CRUD dispatch → feedback."""
+    """Full chat pipeline: sanitize → Claude → CRUD dispatch → feedback.
+    Rate-limit and lock are applied by the caller before invoking this."""
     if len(message) > _MSG_MAX_LEN:
-        return f"⚠️ Tin nhắn quá dài (tối đa {_MSG_MAX_LEN} ký tự)."
+        return f"⚠️ `message_too_long:max={_MSG_MAX_LEN}`"
 
     if "[EXECUTE:" in message:
         message = message.replace("[EXECUTE:", "[BLOCKED:")
 
-    if not _rate_check(user.account_number):
-        return f"⚠️ Quá nhiều yêu cầu. Giới hạn: {_RATE_LIMIT} lần/{_RATE_WINDOW}s. Vui lòng thử lại sau."
-
     if not CLAUDE_API_KEY:
-        return "⚠️ Claude API key chưa được cấu hình."
+        return "⚠️ `claude_api_key_not_configured`"
 
     messages = _conv_get(user.account_number) + [{"role": "user", "content": message}]
 
     try:
         resp = await asyncio.wait_for(
             _claude.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=1024,
-                system=STRATEGY_SYSTEM_PROMPT + "\n\n## CURRENT EA STRATEGIES\n"
-                       + _strategy_context(user.account_number),
+                model=CLAUDE_CHAT_MODEL,
+                max_tokens=CLAUDE_CHAT_MAX_TOKENS,
+                system=[
+                    {"type": "text", "text": STRATEGY_SYSTEM_PROMPT,
+                     "cache_control": {"type": "ephemeral"}},
+                    {"type": "text", "text": "\n\n## CURRENT EA STRATEGIES\n"
+                                             + _strategy_context(user.account_number)},
+                ],
                 messages=messages,
             ),
             timeout=30.0,
         )
     except asyncio.TimeoutError:
-        return "⚠️ Claude API timeout. Vui lòng thử lại."
+        return "⚠️ `claude_timeout`"
     except anthropic.AuthenticationError:
-        return "⚠️ Claude API key không hợp lệ."
+        return "⚠️ `claude_auth_error`"
     except anthropic.APIConnectionError:
-        return "⚠️ Không thể kết nối Claude API."
+        return "⚠️ `claude_connection_error`"
     except Exception as e:
-        return f"⚠️ Lỗi Claude: {e}"
+        return f"⚠️ `claude_error:{e}`"
 
     reply = resp.content[0].text
 
@@ -1048,21 +1886,70 @@ async def _handle_chat_ws(message: str, user: "User") -> str:
 
     action = _extract_execute(reply)
     if action:
-        op  = action.get("op", "")
-        sid = int(action.get("sid", 0))
+        op = action.get("op", "")
 
-        if op not in VALID_OPS:
+        # ── Order ops ─────────────────────────────────────────────────────
+        if op == "market_query":
+            reply = _strip_execute(reply)
+            acct  = user.account_number
+            mq_result = await _ea_request(acct, {
+                "event":      "market_query_request",
+                "symbol":     action.get("symbol", ""),
+                "tf":         int(action.get("tf", 60)),
+                "bars":       min(int(action.get("bars", 5)), 50),
+                "indicators": action.get("indicators", []),
+            }, timeout=10.0)
+            if mq_result is None:
+                reply += "\n\n---\n⚠️ `market_query_timeout` — EA did not respond."
+            else:
+                formatted = _format_market_data(mq_result)
+                inject_msgs = _conv_get(acct) + [{
+                    "role": "user",
+                    "content": (
+                        f"[MARKET_DATA from MT4]\n{formatted}\n[/MARKET_DATA]\n"
+                        "Answer the user's question based on the data above. "
+                        "Be concise. Do NOT reproduce a raw table — "
+                        "summarize key values inline or as a short bullet list."
+                    ),
+                }]
+                try:
+                    resp2 = await asyncio.wait_for(
+                        _claude.messages.create(
+                            model=CLAUDE_CHAT_MODEL,
+                            max_tokens=CLAUDE_CHAT_MAX_TOKENS,
+                            system=[{"type": "text", "text": STRATEGY_SYSTEM_PROMPT,
+                                     "cache_control": {"type": "ephemeral"}}],
+                            messages=inject_msgs,
+                        ),
+                        timeout=30.0,
+                    )
+                    reply = resp2.content[0].text
+                except Exception:
+                    reply = formatted
+            _conv_update_last_assistant(acct, reply)
+            action = None
+
+        elif op in VALID_ORDER_OPS:
+            reply = _strip_execute(reply)
+            reply += await _handle_order_execute(action, user.account_number)
+            _conv_update_last_assistant(user.account_number, reply)
+            action = None
+
+        else:
+            sid = int(action.get("sid", 0))
+
+        if action is not None and op not in VALID_OPS:
             logger.warning(f"CRUD blocked: invalid op={op!r} account={user.account_number}")
             action = None
-        elif sid not in VALID_SID:
+        elif action is not None and sid not in VALID_SID:
             logger.warning(f"CRUD blocked: sid={sid} out of range account={user.account_number}")
             action = None
-        elif op == "add":
+        elif action is not None and op == "add":
             action["lot"] = max(0.01, min(float(action.get("lot", 0.1)), 100.0))
             action["sl"]  = max(1,    min(int(action.get("sl",  50)),   10000))
             action["tp"]  = max(1,    min(int(action.get("tp",  100)),  10000))
             action["tf"]  = int(action.get("tf", 0)) if int(action.get("tf", 0)) in VALID_TFS else 0
-        elif op == "update":
+        elif action is not None and op == "update":
             if "lot" in action: action["lot"] = max(0.01, min(float(action["lot"]), 100.0))
             if "sl"  in action: action["sl"]  = max(1,    min(int(action["sl"]),   10000))
             if "tp"  in action: action["tp"]  = max(1,    min(int(action["tp"]),   10000))
@@ -1087,39 +1974,49 @@ async def _handle_chat_ws(message: str, user: "User") -> str:
                 config = await _call_init_claude(prompt_str, lot=lot, sl=sl, tp=tp, tf=tf)
                 if config is None:
                     crud_result = "parse_error"
+                elif config.get("action") == "UNSUPPORTED":
+                    crud_result = "parse_error"
+                    crud_error  = f"unsupported:{config.get('reason', 'strategy too complex')}"
                 else:
-                    resolved_lot = config.get("lot",       lot)
-                    resolved_sl  = config.get("sl_pip",    sl)
-                    resolved_tp  = config.get("tp_pip",    tp)
-                    payload: dict = {
-                        "event": "strategy_add",
-                        "sid":   sid,
-                        "config": {
-                            "prompt":     prompt_str,
-                            "lot":        resolved_lot,
-                            "sl_pip":     resolved_sl,
-                            "sl":         resolved_sl,
-                            "tp_pip":     resolved_tp,
-                            "tp":         resolved_tp,
-                            "tf":         config.get("tf",        tf),
-                            "action":     config.get("action",    "BUY"),
-                            "symbol":     config.get("symbol",    ""),
-                            "ohlc_bars":  config.get("ohlc_bars", 3),
-                            "indicators": config.get("indicators", []),
-                            "condition":  config.get("condition",  {}),
+                    _ok, _reason = _validate_strategy_config(config)
+                    if not _ok:
+                        crud_result = "parse_error"
+                        crud_error  = _reason
+                    else:
+                        resolved_lot = config.get("lot",       lot)
+                        resolved_sl  = config.get("sl_pip",    sl)
+                        resolved_tp  = config.get("tp_pip",    tp)
+                        payload: dict = {
+                            "event": "strategy_add",
+                            "sid":   sid,
+                            "config": {
+                                "prompt":     prompt_str,
+                                "lot":        resolved_lot,
+                                "sl_pip":     resolved_sl,
+                                "sl":         resolved_sl,
+                                "tp_pip":     resolved_tp,
+                                "tp":         resolved_tp,
+                                "tf":         config.get("tf",        tf),
+                                "action":     config.get("action",    "BUY"),
+                                "symbol":     config.get("symbol",    ""),
+                                "ohlc_bars":  config.get("ohlc_bars", 3),
+                                "indicators":      config.get("indicators",      []),
+                                "condition":       config.get("condition",       {}),
+                                "exit_condition":  config.get("exit_condition",  {}),
+                            }
                         }
-                    }
-                    _strategy_store_save(acct, sid, {
-                        "prompt": prompt_str,
-                        "lot":    resolved_lot,
-                        "sl":     resolved_sl,
-                        "tp":     resolved_tp,
-                        "tf":     config.get("tf",     tf),
-                        "action": config.get("action", "BUY"),
-                        "symbol": config.get("symbol", ""),
-                    })
-                    await ws_ea_push(acct, payload)
-                    crud_result = "sent" if ea_connected else "no_ea"
+                        _strategy_store_save(acct, sid, {
+                            "prompt":  prompt_str,
+                            "lot":     resolved_lot,
+                            "sl":      resolved_sl,
+                            "tp":      resolved_tp,
+                            "tf":      config.get("tf",     tf),
+                            "action":  config.get("action", "BUY"),
+                            "symbol":  config.get("symbol", ""),
+                            "enabled": True,
+                        })
+                        await ws_ea_push(acct, payload)
+                        crud_result = "sent" if ea_connected else "no_ea"
 
             elif op == "update":
                 existing = strategy_store.get(acct, {}).get(sid, {})
@@ -1136,48 +2033,62 @@ async def _handle_chat_ws(message: str, user: "User") -> str:
                                                      tp=new_tp, tf=new_tf)
                     if config is None:
                         crud_result = "parse_error"
+                    elif config.get("action") == "UNSUPPORTED":
+                        crud_result = "parse_error"
+                        crud_error  = f"unsupported:{config.get('reason', 'strategy too complex')}"
                     else:
-                        resolved_lot = config.get("lot",    new_lot)
-                        resolved_sl  = config.get("sl_pip", new_sl)
-                        resolved_tp  = config.get("tp_pip", new_tp)
-                        payload = {
-                            "event": "strategy_add",
-                            "sid":   sid,
-                            "config": {
-                                "prompt":     new_prompt,
-                                "lot":        resolved_lot,
-                                "sl_pip":     resolved_sl,
-                                "sl":         resolved_sl,
-                                "tp_pip":     resolved_tp,
-                                "tp":         resolved_tp,
-                                "tf":         config.get("tf",        new_tf),
-                                "action":     config.get("action",    "BUY"),
-                                "symbol":     config.get("symbol",    new_sym),
-                                "ohlc_bars":  config.get("ohlc_bars", 3),
-                                "indicators": config.get("indicators", []),
-                                "condition":  config.get("condition",  {}),
+                        _ok, _reason = _validate_strategy_config(config)
+                        if not _ok:
+                            crud_result = "parse_error"
+                            crud_error  = _reason
+                        else:
+                            resolved_lot = config.get("lot",    new_lot)
+                            resolved_sl  = config.get("sl_pip", new_sl)
+                            resolved_tp  = config.get("tp_pip", new_tp)
+                            payload = {
+                                "event": "strategy_add",
+                                "sid":   sid,
+                                "config": {
+                                    "prompt":     new_prompt,
+                                    "lot":        resolved_lot,
+                                    "sl_pip":     resolved_sl,
+                                    "sl":         resolved_sl,
+                                    "tp_pip":     resolved_tp,
+                                    "tp":         resolved_tp,
+                                    "tf":         config.get("tf",        new_tf),
+                                    "action":     config.get("action",    "BUY"),
+                                    "symbol":     config.get("symbol",    new_sym),
+                                    "ohlc_bars":  config.get("ohlc_bars", 3),
+                                    "indicators":      config.get("indicators",      []),
+                                    "condition":       config.get("condition",       {}),
+                                    "exit_condition":  config.get("exit_condition",  {}),
+                                }
                             }
-                        }
-                        _strategy_store_save(acct, sid, {
-                            "prompt": new_prompt,
-                            "lot":    resolved_lot,
-                            "sl":     resolved_sl,
-                            "tp":     resolved_tp,
-                            "tf":     config.get("tf",     new_tf),
-                            "action": config.get("action", "BUY"),
-                            "symbol": config.get("symbol", new_sym),
-                        })
-                        await ws_ea_push(acct, payload)
-                        crud_result = "sent" if ea_connected else "no_ea"
+                            _strategy_store_save(acct, sid, {
+                                "prompt":  new_prompt,
+                                "lot":     resolved_lot,
+                                "sl":      resolved_sl,
+                                "tp":      resolved_tp,
+                                "tf":      config.get("tf",     new_tf),
+                                "action":  config.get("action", "BUY"),
+                                "symbol":  config.get("symbol", new_sym),
+                                "enabled": existing.get("enabled", True),
+                            })
+                            await ws_ea_push(acct, payload)
+                            crud_result = "sent" if ea_connected else "no_ea"
                 else:
-                    # Parameters only (lot/sl/tp/tf) → partial update, keep condition tree
+                    # Parameters only (lot/sl/tp/tf/enabled) → partial update
                     upd: dict = {"event": "strategy_update", "sid": sid}
+                    store_upd: dict = {}
                     for k in ("lot", "sl", "tp", "tf"):
                         if k in action:
                             upd[k] = action[k]
-                    _strategy_store_save(acct, sid, {**existing, **{
-                        k: upd[k] for k in ("lot", "sl", "tp", "tf") if k in upd
-                    }})
+                            store_upd[k] = action[k]
+                    if "enabled" in action:
+                        en = bool(action["enabled"])
+                        upd["enabled"] = 1 if en else 0
+                        store_upd["enabled"] = en
+                    _strategy_store_save(acct, sid, {**existing, **store_upd})
                     await ws_ea_push(acct, upd)
                     crud_result = "sent" if ea_connected else "no_ea"
 
@@ -1197,33 +2108,22 @@ async def _handle_chat_ws(message: str, user: "User") -> str:
         reply = _strip_execute(reply)
 
         if crud_result == "parse_error":
-            reply += (
-                "\n\n---\n"
-                "❌ **Lỗi:** Không thể phân tích strategy từ mô tả của bạn. "
-                "Vui lòng mô tả rõ hơn (instrument, hướng BUY/SELL, điều kiện vào lệnh) và thử lại."
-            )
+            error_code = crud_error or "parse_failed"
+            # Inject into history so Claude explains in the user's language next turn
+            _conv_append(user.account_number, "assistant",
+                         f"[STRATEGY_ERROR:{error_code}]")
+            reply += f"\n\n❌ `strategy_error:{error_code}`"
         elif crud_result == "error":
             reply += (
                 f"\n\n---\n"
-                f"❌ **Lỗi khi gửi đến EA:** `{crud_error}`\n"
-                f"Vui lòng kiểm tra kết nối và thử lại."
+                f"❌ **EA error:** `{crud_error}`\n"
+                f"Please check the connection and try again."
             )
         elif crud_result in ("no_ea", "sent"):
-            if crud_result == "no_ea":
-                op_vi = {"add": "thêm", "update": "cập nhật", "delete": "xóa"}.get(op, op)
-                reply += (
-                    f"\n\n---\n"
-                    f"⚠️ **EA chưa kết nối WebSocket** — lệnh {op_vi} đã ghi nhận "
-                    f"nhưng chưa áp dụng vào MT4.\nKhởi động lại EA để đồng bộ."
-                )
-            else:
-                slot_name = f"S{sid + 1}"
-                op_msg = {
-                    "add":    f"✅ **Strategy {slot_name} đã được áp dụng vào EA thành công!**",
-                    "update": f"✅ **Strategy {slot_name} đã được cập nhật thành công!**",
-                    "delete": f"✅ **Strategy {slot_name} đã bị xóa thành công!**",
-                }.get(op, "✅ **Thao tác thành công!**")
-                reply += f"\n\n---\n{op_msg}"
+            reply += _format_strategy_summary(
+                user.account_number, sid, op, ea_connected=(crud_result == "sent"),
+                old_values=existing if op == "update" else None,
+            )
 
     logger.info(f"Chat {user.account_number}: {message[:50]}...")
     return reply
@@ -1264,7 +2164,18 @@ async def ws_chat_connect(
 
     try:
         while True:
-            data = await ws.receive_json()
+            raw = await ws.receive_text()
+
+            # Hard size limit — reject oversized frames immediately
+            if len(raw.encode()) > _WS_MSG_MAX_BYTES:
+                await ws.send_json({"event": "error", "message": "message_too_large"})
+                continue
+
+            try:
+                data = __import__("json").loads(raw)
+            except Exception:
+                continue
+
             event = data.get("event", "")
 
             if event == "ping":
@@ -1275,12 +2186,26 @@ async def ws_chat_connect(
                 if not message:
                     continue
 
-                # Reuse the full chat pipeline (rate limit, input sanitize, Claude, CRUD)
-                reply = await _handle_chat_ws(message, user)
+                # Rate limit on WS (same as HTTP)
+                if not _rate_check(user.account_number):
+                    await ws.send_json({
+                        "event": "chat_reply",
+                        "reply": f"⚠️ `rate_limited:max={_RATE_LIMIT}/{_RATE_WINDOW}s`",
+                    })
+                    continue
+
+                # Per-account lock: prevent concurrent CRUD race conditions
+                lock = _account_locks.setdefault(user.account_number, asyncio.Lock())
+                async with lock:
+                    reply = await _handle_chat_ws(message, user)
                 await ws.send_json({"event": "chat_reply", "reply": reply})
 
     except WebSocketDisconnect:
         ws_chat_clients.pop(account_number, None)
+        # Cancel any pending EA request future for this account
+        fut = _ea_pending.pop(account_number, None)
+        if fut and not fut.done():
+            fut.cancel()
         logger.info(f"WS-Chat disconnected: {account_number}")
 
 

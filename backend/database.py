@@ -4,10 +4,26 @@ from datetime import datetime, timezone
 from config import DATABASE_URL
 
 _is_sqlite  = DATABASE_URL.startswith("sqlite")
-engine      = create_engine(
-    DATABASE_URL,
-    connect_args={"check_same_thread": False} if _is_sqlite else {},
-)
+
+_pool_kwargs: dict = {}
+if _is_sqlite:
+    # SQLite: single writer, use StaticPool for in-process concurrency safety
+    from sqlalchemy.pool import StaticPool
+    _pool_kwargs = {
+        "connect_args": {"check_same_thread": False},
+        "poolclass": StaticPool,
+    }
+else:
+    # PostgreSQL / MySQL: tune pool for many concurrent users
+    _pool_kwargs = {
+        "pool_size":    10,   # persistent connections kept alive
+        "max_overflow": 20,   # extra connections allowed under burst load
+        "pool_timeout": 30,   # seconds to wait for a connection before raising
+        "pool_recycle": 1800, # recycle connections every 30 min to avoid stale handles
+        "pool_pre_ping": True, # validate connection before use
+    }
+
+engine = create_engine(DATABASE_URL, **_pool_kwargs)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base        = declarative_base()
 

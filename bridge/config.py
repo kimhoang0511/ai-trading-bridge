@@ -21,7 +21,7 @@ def _load_api_key() -> str:
     return key
 
 ANTHROPIC_API_KEY = _load_api_key()
-ANTHROPIC_MODEL   = "claude-sonnet-4-6"
+ANTHROPIC_MODEL   = os.environ.get("CLAUDE_PARSE_MODEL", "claude-sonnet-4-6")
 MAX_TOKENS        = 1000
 
 # ── HTTP Server ───────────────────────────────────────────────────────────────
