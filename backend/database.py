@@ -1,7 +1,15 @@
 from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime, UniqueConstraint
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime, timezone
-from config import DATABASE_URL
+from config import DATABASE_URL as _RAW_DB_URL
+
+# Normalize URL: Railway sometimes injects postgres:// or postgresql+asyncpg://
+# Force psycopg2 (sync driver) for all PostgreSQL connections
+DATABASE_URL = (
+    _RAW_DB_URL
+    .replace("postgresql+asyncpg://", "postgresql://")
+    .replace("postgres://", "postgresql://")
+)
 
 _is_sqlite  = DATABASE_URL.startswith("sqlite")
 
