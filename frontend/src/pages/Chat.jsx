@@ -514,7 +514,7 @@ export default function Chat() {
           <textarea
             style={s.input}
             rows={1}
-            placeholder="Thêm / sửa / xóa strategy... (VD: thêm strategy mua EURUSD khi RSI < 30)"
+            placeholder="Add / edit / delete strategy... (e.g. buy EURUSD when RSI < 30) — any language supported"
             value={input}
             onChange={onInputChange}
             onKeyDown={onKey}
