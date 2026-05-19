@@ -276,9 +276,10 @@ export default function Chat() {
   useEffect(() => {
     if (status !== 'ok' || !userInfo) return
 
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    const wsBase = import.meta.env.VITE_WS_URL
+      ?? `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}`
     const ws = new WebSocket(
-      `${protocol}//${window.location.host}/ws/chat/${userInfo.account_number}?token=${token}`
+      `${wsBase}/ws/chat/${userInfo.account_number}?token=${token}`
     )
     wsRef.current = ws
 
