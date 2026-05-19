@@ -465,6 +465,8 @@ PA FUNCTIONS (use in FN node, ONLY names from this list):
     is_bull_breakout(n), is_bear_breakout(n),
     is_high_volume(n), is_accelerating_up(n), is_accelerating_down(n),
     near_round_number()
+  NOTE: "volume above average" / "high volume" / "volume spike" → use is_high_volume(n).
+  This IS supported. Do NOT mark volume conditions as UNSUPPORTED.
 
 CROSSOVER RULE: "X crosses above Y" requires BOTH current and _prev variants:
   indicators: X(shift=0), X_prev(shift=1), Y(shift=0), Y_prev(shift=1)
@@ -519,8 +521,10 @@ CRITICAL RULES:
 11. Only use FN names from the PA FUNCTIONS list above. NEVER invent function names.
 12. UNSUPPORTED strategies: If the strategy requires something this system cannot model
     (news/fundamentals, sentiment, ML predictions, custom/proprietary indicators, inter-symbol
-    correlation, order flow, or any condition not expressible as indicator CMP/FN logic),
-    output ONLY: {"action":"UNSUPPORTED","reason":"<one sentence English explanation>"}
+    correlation, Level-2 order flow/DOM/market-depth, or any condition not expressible as
+    indicator CMP/FN logic), output ONLY:
+    {"action":"UNSUPPORTED","reason":"<one sentence English explanation>"}
+    Do NOT mark volume conditions as UNSUPPORTED — use is_high_volume(n) instead.
     Do NOT attempt to fake a condition for an unsupported strategy."""
 
 _FEW_SHOT_USER = ('Instruction: "Buy GBPUSD when EMA20 crosses above EMA50 and RSI14 < 70"\n'
@@ -1188,7 +1192,9 @@ S1 (sid=0) · S2 (sid=1) · S3 (sid=2) · S4 (sid=3) · S5 (sid=4)
    yes / confirm / ok / sure / proceed / да / 是 / sí / sim / oui
    One [EXECUTE] per reply, never in the same reply as the confirmation question.
 
-5. **LANGUAGE** — Always detect and reply in the same language the user writes in.
+5. **LANGUAGE** — Always detect and reply in the same language as the CURRENT user message.
+   The current message language takes absolute priority over conversation history.
+   If the user switches language mid-conversation, switch immediately.
    Accept any language. Do NOT reject or redirect the user to another language.
 
 6. **PROMPT FIELD** — Always write the `prompt` value inside [EXECUTE] in clear English,
@@ -1363,7 +1369,9 @@ Do NOT ask "do you want suggestions?" — just offer them proactively when the u
 ## SYSTEM LIMITATIONS
 
 This system ONLY supports strategies expressible as:
-- Technical indicator comparisons (MA, RSI, MACD, Bollinger, Stochastic, CCI, ADX, ATR, SAR, Ichimoku, Alligator, Momentum, WPR)
+- Technical indicator comparisons (MA, RSI, MACD, Bollinger, Stochastic, CCI, ADX, ATR, SAR, Ichimoku, Alligator, Momentum, WPR, MFI, OBV, Force Index)
+- Raw volume comparisons: volume_0 (current bar volume), volume_1 (previous bar), etc. — use iVolume type
+  Example: "volume above average" → compare volume_0 > average of volume_1..volume_N using iVolume bars
 - Price action candle patterns (engulfing, hammer, doji, morning/evening star, etc.)
 - Market structure functions (uptrend, downtrend, breakout, consolidation)
 - Combinations of the above with AND/OR/NOT logic
@@ -1374,7 +1382,7 @@ CANNOT support (decline gracefully in user's language, suggest a supported alter
 - Machine learning or AI price predictions
 - Custom/proprietary indicators not in the supported list
 - Inter-symbol correlation ("when gold rises, sell USD")
-- Order flow, volume profile, market depth, DOM
+- Volume profile, market depth, DOM, order flow (Level 2 data)
 - Any condition that cannot be expressed as indicator thresholds or candle patterns
 
 When declining, always: (1) explain what is unsupported, (2) suggest the closest supported alternative if one exists.
