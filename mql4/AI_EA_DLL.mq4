@@ -425,12 +425,16 @@ void OnTick()
 
       datetime cur_bar = iTime(g_slots[i].symbol, g_slots[i].tf, 0);
 
-      // Redraw indicators 1 lần/bar (tránh vẽ lại hàng nghìn lần/ngày)
+      // Redraw lines 1 lần/bar (tránh vẽ lại hàng nghìn lần/ngày)
       if (cur_bar != g_slots[i].last_bar) {
          g_slots[i].last_bar = cur_bar;
          if (g_slots[i].chart_id > 0)
             DrawIndicators(i, g_slots[i].chart_id);
       }
+
+      // Update oscillator panel values mỗi tick (RSI/CCI/MACD/Stochastic/WPR/Momentum)
+      if (g_slots[i].chart_id > 0)
+         UpdateOscPanelValues(i, g_slots[i].chart_id);
 
       // Gọi DLL mỗi tick — EvalCond chạy local, không có network
       string values_json = BuildValues(i);
@@ -1685,6 +1689,43 @@ color IndPanelColor(IndConfig &c)
              (c.period<=60)?clrOrangeRed:(c.period<=120)?clrGold:clrMagenta;
    if (c.type=="iBands"||c.type=="iSAR") return clrRoyalBlue;
    return clrSilver;
+}
+
+// Per-tick lightweight update: only TEXT+COLOR of oscillator panel rows
+void UpdateOscPanelValues(int sid, long cid)
+{
+   if (cid <= 0 || !g_slots[sid].active) return;
+   int ic = g_slots[sid].ind_count;
+   if (ic == 0) return;
+
+   // Mirror the row-counting logic of DrawStrategyInfo to find indicator rows
+   // Header: title(1) + sym/tf(1) + lot/sl/tp(1) + prompt lines + separator(1)
+   int prompt_rows = (StringLen(g_slots[sid].prompt) + 51) / 52;
+   if (prompt_rows < 1) prompt_rows = 1;
+   int ind_start_row = 3 + prompt_rows + 1; // +1 for separator
+
+   int row = ind_start_row;
+   for (int k = 0; k < ic; k++) {
+      IndConfig c = g_slots[sid].inds[k];
+      if (StringFind(c.name, "_prev") >= 0) continue;
+
+      // Only oscillators change meaningfully per tick
+      bool is_osc = (c.type=="iRSI" || c.type=="iCCI" || c.type=="iWPR" ||
+                     c.type=="iMomentum" || c.type=="iMACD" || c.type=="iStochastic");
+
+      if (is_osc) {
+         string ln = OBJ_PREFIX+"INFO_L"+IntegerToString(row)+"_S"+IntegerToString(sid);
+         if (ObjectFind(cid, ln) >= 0) {
+            string txt = FormatIndValue(c);
+            if (StringLen(txt) > 0) {
+               ObjectSetString (cid, ln, OBJPROP_TEXT,  txt);
+               ObjectSetInteger(cid, ln, OBJPROP_COLOR, (color)IndPanelColor(c));
+            }
+         }
+      }
+      row++;
+   }
+   ChartRedraw(cid);
 }
 
 void DrawStrategyInfo(int sid, long cid)
