@@ -29,12 +29,11 @@
    int  Bridge_WsGetStatus (uchar &out_buf[], int buf_size);
    int  Bridge_WsSend      (string msg);
    int  Bridge_Ping        (uchar &out_buf[], int buf_size);
-   void Bridge_SetDebug    (int enable);
 #import
 
-//── Developer mode ───────────────────────────────────────────────────
-extern bool   Dev_Mode    = true;   // true → override license_type = DEMO (no Market check)
-extern bool   Tick_Debug  = false;  // true → log mọi tick vào bridge.log (chỉ dùng khi debug)
+//── Logging ──────────────────────────────────────────────────────────
+bool EnableLog = false;
+#define LOG if(EnableLog) Print
 
 //── Strategy 1 ───────────────────────────────────────────────────────
 extern bool            S1_Enable      = false;
@@ -122,7 +121,6 @@ StrategySlot g_slots[MAX_STRATEGIES];
 int          g_active             = 0;
 int          g_account            = 0;
 string       g_token              = "";
-int          g_selected_slot      = -1;  // which slot is highlighted in dashboard
 datetime     g_last_signal_bar[MAX_STRATEGIES]; // cooldown: 1 signal per bar
 
 //+------------------------------------------------------------------+
@@ -138,13 +136,13 @@ void PrintDllLog(string prefix)
    // Print in 200-char chunks so MT4 journal doesn't truncate lines
    int len = StringLen(full);
    for (int pos = 0; pos < len; pos += 200)
-      Print(prefix, " | ", StringSubstr(full, pos, 200));
+      LOG(prefix, " | ", StringSubstr(full, pos, 200));
 }
 
 void ShowChatURL(string token)
 {
    string chat_url = FRONTEND_URL + "/chat?token=" + token;
-   Print("[AI Bridge] Chat URL: ", chat_url);
+   LOG("[AI Bridge] Chat URL: ", chat_url);
    Alert("Access chat bot URL:\n\n" + chat_url +
          "\n\nOpen this URL in your browser to access the chat.");
 }
@@ -159,7 +157,7 @@ int OnInit()
       ArrayResize(ping_buf, 256);
       int ping_rc = Bridge_Ping(ping_buf, 256);
       string ping_res = CharArrayToString(ping_buf, 0, -1);
-      Print("[AI Bridge] Bridge_Ping rc=", ping_rc, " res=", ping_res);
+      LOG("[AI Bridge] Bridge_Ping rc=", ping_rc, " res=", ping_res);
       if (ping_rc != 0) {
          Alert("[AI Bridge] DLL failed self-test: ", ping_res,
                "\nCheck %APPDATA%\\AI_Bridge\\startup.log for details.");
@@ -167,41 +165,22 @@ int OnInit()
       }
    }
 
-   // ── 0b. Tick debug mode ───────────────────────────────────────────────
-   Bridge_SetDebug(Tick_Debug ? 1 : 0);
-   if (Tick_Debug)
-      Print("[AI Bridge] ⚠️ Tick_Debug=true — per-tick logging enabled. "
-            "Disable after debugging to avoid large log files.");
-
    // ── 1. License check & registration ──────────────────────────────────
    int    lic_type = (int)MQLInfoInteger(MQL_LICENSE_TYPE);
    string srv      = AccountServer();
 
-   if (Dev_Mode) {
-      lic_type = LICENSE_DEMO;
-      Print("[AI Bridge] DEV MODE — license_type overridden to DEMO");
-   }
-
-   // LICENSE_FREE → DLL từ chối ngay, không cần gọi backend
-   if (lic_type == LICENSE_FREE) {
-      Alert("[AI Bridge] No license. Please purchase on MQL5 Market.");
-      Print("[AI Bridge] LICENSE_FREE — EA stopped.");
-      return INIT_FAILED;
-   }
-
-   // Gọi backend để lưu account + server_broker vào DB (cả Dev_Mode lẫn production)
+   // Gọi backend để lưu account + server_broker vào DB
    uchar reg_buf[];
    ArrayResize(reg_buf, 2048);
    int reg_rc = Bridge_Register(g_account, srv, lic_type, reg_buf, 2048);
    string reg_res = CharArrayToString(reg_buf, 0, -1);
-   Print("[AI Bridge] Bridge_Register rc=", reg_rc, " res=", StringSubstr(reg_res, 0, 200));
+   LOG("[AI Bridge] Bridge_Register rc=", reg_rc, " res=", StringSubstr(reg_res, 0, 200));
 
-   if (reg_rc != 0 && !Dev_Mode) {
-      // Production: lỗi đăng ký → dừng EA
+   if (reg_rc != 0) {
       string msg = ExtractStr(reg_res, "message");
       if (StringLen(msg) == 0) msg = "License server unavailable";
       Alert("[AI Bridge] " + msg);
-      Print("[AI Bridge] Registration FAILED: ", msg);
+      LOG("[AI Bridge] Registration FAILED: ", msg);
       return INIT_FAILED;
    }
 
@@ -209,7 +188,7 @@ int OnInit()
       // Lấy JWT token từ backend (production + dev khi backend chạy)
       g_token = ExtractStr(reg_res, "token");
       string lic_name = ExtractStr(reg_res, "license_type");
-      Print("[AI Bridge] License OK — type=", lic_name, " token=", StringSubstr(g_token, 0, 20), "...");
+      LOG("[AI Bridge] License OK — type=", lic_name, " token=", StringSubstr(g_token, 0, 20), "...");
    }
 
    if (StringLen(g_token) == 0) {
@@ -227,7 +206,7 @@ int OnInit()
          hex += StringFormat("%02x", enc);
       }
       g_token = "d." + hex;
-      Print("[AI Bridge] DEV MODE offline — local token generated");
+      LOG("[AI Bridge] DEV MODE offline — local token generated");
    }
 
    ShowChatURL(g_token);
@@ -238,13 +217,13 @@ int OnInit()
    LoadSlots();
 
    if (g_active == 0)
-      Print("[AI Bridge] No strategy enabled locally — use chat bot to add strategies.");
+      LOG("[AI Bridge] No strategy enabled locally — use chat bot to add strategies.");
 
    // Show DLL version
    uchar ver_buf[];
    ArrayResize(ver_buf, 64);
    Bridge_Version(ver_buf, 64);
-   Print("AI Bridge DLL v", CharArrayToString(ver_buf, 0, ArraySize(ver_buf)));
+   LOG("AI Bridge DLL v", CharArrayToString(ver_buf, 0, ArraySize(ver_buf)));
 
    // Init each active strategy
    for (int i = 0; i < MAX_STRATEGIES; i++) {
@@ -272,7 +251,7 @@ int OnInit()
          PrintDllLog("DLL_LOG S" + IntegerToString(i));
          string err = ExtractStr(res, "message");
          if (StringLen(err) == 0) err = (StringLen(res) > 0) ? res : "(empty response)";
-         Print("Strategy ", i, " init failed: ", err);
+         LOG("Strategy ", i, " init failed: ", err);
          if (StringFind(res, "License") >= 0) {
             Alert("License invalid. Purchase at: https://www.mql5.com/en/market");
             return INIT_FAILED;
@@ -290,7 +269,7 @@ int OnInit()
       // Override symbol with Claude-detected value (handles typos, "gold"→XAUUSD, etc.)
       string sym_from_bridge = ExtractStr(res, "symbol");
       if (StringLen(sym_from_bridge) > 0 && sym_from_bridge != g_slots[i].symbol) {
-         Print("S", i, " symbol overridden by Claude: ", g_slots[i].symbol, " → ", sym_from_bridge);
+         LOG("S", i, " symbol overridden by Claude: ", g_slots[i].symbol, " → ", sym_from_bridge);
          g_slots[i].symbol = sym_from_bridge;
       }
 
@@ -309,15 +288,14 @@ int OnInit()
 
       // Open a dedicated chart for each active strategy
       g_slots[i].chart_id = OpenStrategyChart(i);
-      if (g_selected_slot < 0) g_selected_slot = i;  // first active = dashboard highlight
 
-      Print("Strategy ", i, " OK (", g_slots[i].symbol, " ",
+      LOG("Strategy ", i, " OK (", g_slots[i].symbol, " ",
             TFtoStr(g_slots[i].tf), " ", g_slots[i].action, "): ",
             StringSubstr(g_slots[i].prompt, 0, 50));
    }
 
    if (g_active == 0)
-      Print("[AI Bridge] No active strategy — waiting for chat bot to add strategies.");
+      LOG("[AI Bridge] No active strategy — waiting for chat bot to add strategies.");
 
    // Draw each strategy's panel on its own chart
    for (int j = 0; j < MAX_STRATEGIES; j++) {
@@ -327,8 +305,7 @@ int OnInit()
       ChartRedraw(g_slots[j].chart_id);
    }
 
-   Print(g_active, " strategies active. EA running. selected_slot=", g_selected_slot);
-   DrawDashboard();
+   LOG(g_active, " strategies active. EA running.");
    EventSetTimer(1);   // poll WS queue every second regardless of ticks
 
    // ── 3. Connect WebSocket for real-time strategy events ────────────────────
@@ -344,19 +321,29 @@ int OnInit()
       string ws_msg     = ExtractStr(ws_res, "message");
       string ws_conn    = ExtractStr(ws_res, "connected");
 
+      if (ws_rc == 0 || ws_rc == 1) {
+         // Push correct enabled state so backend strategy_store reflects S*_Enable params
+         for (int _i = 0; _i < MAX_STRATEGIES; _i++) {
+            if (!g_slots[_i].active) continue;
+            string _en_msg = "{\"event\":\"strategy_update\",\"sid\":" + IntegerToString(_i)
+                           + ",\"enabled\":" + (g_slots[_i].enabled ? "1" : "0") + "}";
+            Bridge_WsSend(_en_msg);
+         }
+      }
+
       if (ws_rc == 0) {
          // rc=0 = connected (Bridge_WsConnect only returns 0 when g_ws_connected==true)
-         Print("[AI Bridge] WebSocket CONNECTED — account=", g_account,
+         LOG("[AI Bridge] WebSocket CONNECTED — account=", g_account,
                "  reconnect_count=", (int)ExtractNum(ws_res, "reconnect_count"));
       } else if (ws_rc == 1) {
-         Print("[AI Bridge] WebSocket: thread started, connecting in background...");
-         Print("[AI Bridge]   → Check %APPDATA%\\AI_Bridge\\bridge.log if it stays disconnected");
+         LOG("[AI Bridge] WebSocket: thread started, connecting in background...");
+         LOG("[AI Bridge]   → Check %APPDATA%\\AI_Bridge\\bridge.log if it stays disconnected");
       } else {
          // rc=-1: genuine failure
          string detail = (StringLen(ws_msg) > 0) ? ws_msg : ws_res;
-         Print("[AI Bridge] WebSocket FAILED (rc=", ws_rc, "): ", detail);
-         Print("[AI Bridge]   → Strategy updates from chat will NOT work.");
-         Print("[AI Bridge]   → Check: backend running? host=192.168.21.1:8000 reachable?");
+         LOG("[AI Bridge] WebSocket FAILED (rc=", ws_rc, "): ", detail);
+         LOG("[AI Bridge]   → Strategy updates from chat will NOT work.");
+         LOG("[AI Bridge]   → Check: backend running? host=192.168.21.1:8000 reachable?");
          Alert("[AI Bridge] WebSocket connection failed:\n" + detail +
                "\n\nStrategy chat updates will not reach the EA.\n"
                "Check bridge.log: %APPDATA%\\AI_Bridge\\bridge.log");
@@ -371,12 +358,33 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnTimer()
 {
+   // ── Reconnect detection: push enabled state whenever a new WS connection is made ──
+   // Covers both initial connect and auto-reconnect after network drop.
+   // More reliable than the OnInit push (which can be dropped if ws_rc==1).
+   static int s_last_reconnect = -1;
+   uchar st_buf[];
+   ArrayResize(st_buf, 256);
+   if (Bridge_WsGetStatus(st_buf, 256) == 1) {
+      int rc_n = (int)ExtractNum(CharArrayToString(st_buf, 0, -1), "reconnect_count");
+      if (rc_n > 0 && rc_n != s_last_reconnect) {
+         s_last_reconnect = rc_n;
+         for (int _i = 0; _i < MAX_STRATEGIES; _i++) {
+            if (!g_slots[_i].active) continue;
+            string _msg = "{\"event\":\"strategy_update\",\"sid\":" + IntegerToString(_i)
+                        + ",\"enabled\":" + (g_slots[_i].enabled ? "1" : "0") + "}";
+            Bridge_WsSend(_msg);
+         }
+         LOG("[WS] enabled state pushed after connect #", rc_n);
+      }
+   }
+
+   // ── Poll WS message queue ──
    uchar ws_out[];
    ArrayResize(ws_out, BUF_SIZE);
    int ws_n = Bridge_WsPoll(ws_out, BUF_SIZE);
    if (ws_n > 0) {
       string ws_msg = CharArrayToString(ws_out, 0, -1);
-      Print("[WS-Timer] event: ", StringSubstr(ws_msg, 0, 100));
+      LOG("[WS-Timer] event: ", StringSubstr(ws_msg, 0, 100));
       HandleWsEvent(ws_msg);
    }
 }
@@ -404,10 +412,10 @@ void OnTick()
       int    reconnect_n  = (int)ExtractNum(st, "reconnect_count");
       int    q_sz         = (int)ExtractNum(st, "queue_size");
       if (st_rc == 1) {
-         Print("[WS-Status] connected=true  reconnects=", reconnect_n,
+         LOG("[WS-Status] connected=true  reconnects=", reconnect_n,
                "  queue=", q_sz);
       } else {
-         Print("[WS-Status] DISCONNECTED  reconnects=", reconnect_n,
+         LOG("[WS-Status] DISCONNECTED  reconnects=", reconnect_n,
                "  last_err=", last_err);
       }
    }
@@ -451,27 +459,6 @@ void OnTick()
    }
 }
 
-//+------------------------------------------------------------------+
-//| OnChartEvent — click dashboard row để đổi strategy đang hiển thị|
-//+------------------------------------------------------------------+
-void OnChartEvent(const int id, const long& lparam,
-                  const double& dparam, const string& sparam)
-{
-   if (id != CHARTEVENT_OBJECT_CLICK) return;
-
-   for (int i = 0; i < MAX_STRATEGIES; i++) {
-      if (!g_slots[i].active) continue;
-      if (sparam != OBJ_PREFIX + "PANEL_S" + IntegerToString(i)) continue;
-
-      if (i == g_selected_slot) return; // đã đang hiển thị slot này
-
-      Print("Switch selected slot: ", g_selected_slot, " → ", i);
-      g_selected_slot = i;
-      // Each slot has its own chart — just update dashboard highlight (► marker)
-      DrawDashboard();
-      return;
-   }
-}
 
 //+------------------------------------------------------------------+
 //| OnDeinit                                                         |
@@ -488,7 +475,7 @@ void OnDeinit(const int reason)
       case REASON_ACCOUNT:    why="account changed";    break;
       default:                why="reason="+IntegerToString(reason); break;
    }
-   Print("OnDeinit: ", why);
+   LOG("OnDeinit: ", why);
 
    EventKillTimer();
    Bridge_WsDisconnect();
@@ -503,9 +490,8 @@ void OnDeinit(const int reason)
          ChartClose(g_slots[j].chart_id);
       g_slots[j].chart_id = 0;
    }
-   g_selected_slot = -1;
    CleanObjects();
-   Print("EA stopped.");
+   LOG("EA stopped.");
 }
 
 //+------------------------------------------------------------------+
@@ -680,7 +666,7 @@ void HandleOrderOpen(string msg)
          tp_price = 0;
    }
 
-   Print("[WS] order_open ", symbol, " type=", typ,
+   LOG("[WS] order_open ", symbol, " type=", typ,
          " pip=", pip, " min_stop=", min_stop,
          " sl_pips=", sl_pips, " sl_abs=", sl_abs, " sl_price=", sl_price,
          " tp_pips=", tp_pips, " tp_abs=", tp_abs, " tp_price=", tp_price);
@@ -692,7 +678,7 @@ void HandleOrderOpen(string msg)
       int err = GetLastError();
       reply = "{\"event\":\"order_result\",\"request_id\":\"" + req_id + "\""
             + ",\"success\":false,\"error\":" + IntegerToString(err) + "}";
-      Print("[WS] order_open FAILED err=", err);
+      LOG("[WS] order_open FAILED err=", err);
    } else {
       OrderSelect(ticket, SELECT_BY_TICKET);
       reply = "{\"event\":\"order_result\",\"request_id\":\"" + req_id + "\""
@@ -700,7 +686,7 @@ void HandleOrderOpen(string msg)
             + ",\"symbol\":\"" + symbol + "\",\"type\":\"" + typ + "\""
             + ",\"lot\":" + DoubleToStr(lot, 2)
             + ",\"open_price\":" + DoubleToStr(OrderOpenPrice(), 5) + "}";
-      Print("[WS] order_open OK ticket=", ticket, " ", typ, " ", symbol, " lot=", lot);
+      LOG("[WS] order_open OK ticket=", ticket, " ", typ, " ", symbol, " lot=", lot);
    }
    Bridge_WsSend(reply);
 }
@@ -726,12 +712,12 @@ void HandleOrderClose(string msg)
                + ",\"success\":true,\"ticket\":" + IntegerToString(ticket)
                + ",\"close_price\":" + DoubleToStr(close, 5)
                + ",\"profit\":" + DoubleToStr(profit, 2) + "}";
-         Print("[WS] order_close OK ticket=", ticket, " profit=", profit);
+         LOG("[WS] order_close OK ticket=", ticket, " profit=", profit);
       } else {
          int err = GetLastError();
          reply = "{\"event\":\"order_result\",\"request_id\":\"" + req_id + "\""
                + ",\"success\":false,\"error\":" + IntegerToString(err) + "}";
-         Print("[WS] order_close FAILED err=", err);
+         LOG("[WS] order_close FAILED err=", err);
       }
    }
    Bridge_WsSend(reply);
@@ -747,7 +733,6 @@ void HandleOrderCloseAll(string msg)
 
    for (int i = OrdersTotal() - 1; i >= 0; i--) {
       if (!OrderSelect(i, SELECT_BY_POS)) continue;
-      if ((int)OrderMagicNumber() != CHAT_ORDER_MAGIC) continue;
       if (OrderType() != OP_BUY && OrderType() != OP_SELL) continue;
       if (StringLen(filter_sym) > 0 && OrderSymbol() != filter_sym) continue;
 
@@ -768,10 +753,10 @@ void HandleOrderCloseAll(string msg)
                       + ",\"close_price\":" + DoubleToStr(price, 5)
                       + ",\"profit\":" + DoubleToStr(profit, 2) + "}";
          closed++;
-         Print("[WS] order_close_all: closed ticket=", ticket, " profit=", profit);
+         LOG("[WS] order_close_all: closed ticket=", ticket, " profit=", profit);
       } else {
          failed++;
-         Print("[WS] order_close_all: failed ticket=", ticket, " err=", GetLastError());
+         LOG("[WS] order_close_all: failed ticket=", ticket, " err=", GetLastError());
       }
    }
    orders_json += "]";
@@ -781,7 +766,7 @@ void HandleOrderCloseAll(string msg)
                 + ",\"failed\":" + IntegerToString(failed)
                 + ",\"orders\":" + orders_json + "}";
    Bridge_WsSend(reply);
-   Print("[WS] order_close_all done closed=", closed, " failed=", failed);
+   LOG("[WS] order_close_all done closed=", closed, " failed=", failed);
 }
 
 void HandleOrderModify(string msg)
@@ -829,7 +814,7 @@ void HandleOrderModify(string msg)
       if (tp > 0 && tp > cur_bid - min_stop) tp = cur_bid - min_stop;
    }
 
-   Print("[WS] order_modify ticket=", ticket, " sym=", sym,
+   LOG("[WS] order_modify ticket=", ticket, " sym=", sym,
          " open=", open_price,
          " new_sl_pip=", new_sl_pip, " sl_price=", sl,
          " new_tp_pip=", new_tp_pip, " tp_price=", tp,
@@ -847,13 +832,13 @@ void HandleOrderModify(string msg)
             + ",\"old_tp\":" + DoubleToStr(old_tp, 5)
             + ",\"sl\":" + DoubleToStr(actual_sl, 5)
             + ",\"tp\":" + DoubleToStr(actual_tp, 5) + "}";
-      Print("[WS] order_modify OK ticket=", ticket,
+      LOG("[WS] order_modify OK ticket=", ticket,
             " actual_sl=", actual_sl, " actual_tp=", actual_tp);
    } else {
       int err = GetLastError();
       reply = "{\"event\":\"order_result\",\"request_id\":\"" + req_id + "\""
             + ",\"success\":false,\"error\":" + IntegerToString(err) + "}";
-      Print("[WS] order_modify FAILED err=", err,
+      LOG("[WS] order_modify FAILED err=", err,
             " sl=", sl, " tp=", tp, " min_stop=", min_stop);
    }
    Bridge_WsSend(reply);
@@ -878,7 +863,7 @@ void HandleOrderListRequest(string msg)
    string reply = "{\"event\":\"order_list\",\"request_id\":\"" + req_id + "\""
                 + ",\"orders\":" + json + "}";
    Bridge_WsSend(reply);
-   Print("[WS] order_list sent total=", OrdersTotal());
+   LOG("[WS] order_list sent total=", OrdersTotal());
 }
 
 void HandleOrderHistoryLast(string msg)
@@ -907,7 +892,7 @@ void HandleOrderHistoryLast(string msg)
    string reply = "{\"event\":\"order_history\",\"request_id\":\"" + req_id + "\""
                 + ",\"orders\":" + json + "}";
    Bridge_WsSend(reply);
-   Print("[WS] order_history_last sent count=", count, " limit=", limit);
+   LOG("[WS] order_history_last sent count=", count, " limit=", limit);
 }
 
 void HandleOrderHistory48h(string msg)
@@ -935,7 +920,7 @@ void HandleOrderHistory48h(string msg)
    string reply = "{\"event\":\"order_history\",\"request_id\":\"" + req_id + "\""
                 + ",\"orders\":" + json + "}";
    Bridge_WsSend(reply);
-   Print("[WS] order_history_48h sent count=", count);
+   LOG("[WS] order_history_48h sent count=", count);
 }
 
 // ── Market query ────────────────────────────────────────────────────────────
@@ -1049,7 +1034,7 @@ void HandleMarketQueryRequest(string msg)
                 + ",\"indicators\":" + inds_json
                 + "}";
    Bridge_WsSend(reply);
-   Print("[WS] market_query response sent symbol=", symbol,
+   LOG("[WS] market_query response sent symbol=", symbol,
          " tf=", tf, " bars=", bars);
 }
 
@@ -1070,10 +1055,35 @@ void HandleWsEvent(string msg)
    if (event == "order_history_48h_request")  { HandleOrderHistory48h(msg);        return; }
    if (event == "market_query_request")       { HandleMarketQueryRequest(msg);     return; }
 
+   if (event == "strategy_list_request") {
+      string _rpl = "{\"event\":\"strategy_list_response\",\"strategies\":[";
+      bool _first = true;
+      for (int _ri = 0; _ri < MAX_STRATEGIES; _ri++) {
+         if (!g_slots[_ri].active) continue;
+         if (!_first) _rpl += ",";
+         string _prompt = g_slots[_ri].prompt;
+         StringReplace(_prompt, "\"", "'");
+         _rpl += "{\"sid\":"      + IntegerToString(_ri)
+               + ",\"enabled\":"  + (g_slots[_ri].enabled ? "1" : "0")
+               + ",\"lot\":"      + DoubleToStr(g_slots[_ri].lot, 2)
+               + ",\"sl\":"       + IntegerToString(g_slots[_ri].sl)
+               + ",\"tp\":"       + IntegerToString(g_slots[_ri].tp)
+               + ",\"tf\":"       + IntegerToString(g_slots[_ri].tf)
+               + ",\"action\":\"" + g_slots[_ri].action + "\""
+               + ",\"symbol\":\"" + g_slots[_ri].symbol + "\""
+               + ",\"prompt\":\"" + _prompt + "\""
+               + "}";
+         _first = false;
+      }
+      _rpl += "]}";
+      Bridge_WsSend(_rpl);
+      return;
+   }
+
    // Strategy events — require valid sid
    int sid = (int)ExtractNum(msg, "sid");
    if (sid < 0 || sid >= MAX_STRATEGIES) {
-      Print("[WS] unknown sid in event: ", StringSubstr(msg, 0, 80));
+      LOG("[WS] unknown sid in event: ", StringSubstr(msg, 0, 80));
       return;
    }
 
@@ -1113,7 +1123,7 @@ void HandleWsEvent(string msg)
       if (StringFind(msg, "\"enabled\"") >= 0)
          g_slots[sid].enabled = ((int)ExtractNum(msg, "enabled") != 0);
 
-      Print("[WS] ", event, " S", sid,
+      LOG("[WS] ", event, " S", sid,
             " sym=",  g_slots[sid].symbol,
             " tf=",   g_slots[sid].tf,
             " act=",  g_slots[sid].action,
@@ -1124,14 +1134,18 @@ void HandleWsEvent(string msg)
       if (g_slots[sid].chart_id <= 0) {
          // New slot — open a dedicated chart window
          g_slots[sid].chart_id = OpenStrategyChart(sid);
-         if (g_selected_slot < 0) g_selected_slot = sid;
       } else {
          // Chart already exists — switch symbol/TF if changed
          string cur_sym = ChartSymbol(g_slots[sid].chart_id);
          int    cur_tf  = (int)ChartPeriod(g_slots[sid].chart_id);
          if (cur_sym != g_slots[sid].symbol || cur_tf != g_slots[sid].tf) {
-            ChartSetSymbolPeriod(g_slots[sid].chart_id, g_slots[sid].symbol, g_slots[sid].tf);
-            ObjectsDeleteAll(g_slots[sid].chart_id, OBJ_PREFIX);
+            if (g_slots[sid].chart_id == ChartID()) {
+               // Never change main chart symbol/TF — open a dedicated chart instead
+               g_slots[sid].chart_id = OpenStrategyChart(sid);
+            } else {
+               ChartSetSymbolPeriod(g_slots[sid].chart_id, g_slots[sid].symbol, g_slots[sid].tf);
+               ObjectsDeleteAll(g_slots[sid].chart_id, OBJ_PREFIX);
+            }
          }
       }
 
@@ -1140,7 +1154,6 @@ void HandleWsEvent(string msg)
          DrawIndicators(sid, g_slots[sid].chart_id);
          ChartRedraw(g_slots[sid].chart_id);
       }
-      DrawDashboard();
    }
    else if (event == "strategy_update") {
       // Partial update — only fields present in the payload
@@ -1166,7 +1179,7 @@ void HandleWsEvent(string msg)
       if (StringFind(msg, "\"enabled\"") >= 0)
          g_slots[sid].enabled = ((int)ExtractNum(msg, "enabled") != 0);
 
-      Print("[WS] strategy_update S", sid,
+      LOG("[WS] strategy_update S", sid,
             " lot=", g_slots[sid].lot,
             " sl=",  g_slots[sid].sl,
             " tp=",  g_slots[sid].tp,
@@ -1174,14 +1187,18 @@ void HandleWsEvent(string msg)
 
       if (g_slots[sid].chart_id > 0) {
          if (upd_tf > 0) {
-            ChartSetSymbolPeriod(g_slots[sid].chart_id, g_slots[sid].symbol, g_slots[sid].tf);
-            ObjectsDeleteAll(g_slots[sid].chart_id, OBJ_PREFIX);
+            if (g_slots[sid].chart_id == ChartID()) {
+               // Never change main chart symbol/TF — open a dedicated chart instead
+               g_slots[sid].chart_id = OpenStrategyChart(sid);
+            } else {
+               ChartSetSymbolPeriod(g_slots[sid].chart_id, g_slots[sid].symbol, g_slots[sid].tf);
+               ObjectsDeleteAll(g_slots[sid].chart_id, OBJ_PREFIX);
+            }
             DrawIndicators(sid, g_slots[sid].chart_id);
          }
          DrawStrategyInfo(sid, g_slots[sid].chart_id);
          ChartRedraw(g_slots[sid].chart_id);
       }
-      DrawDashboard();
    }
    else if (event == "strategy_delete") {
       if (g_slots[sid].active) {
@@ -1189,23 +1206,19 @@ void HandleWsEvent(string msg)
          g_slots[sid].active = false;
          g_last_signal_bar[sid] = 0;
          g_active = MathMax(g_active - 1, 0);
-         // Close this slot's dedicated chart window
-         if (g_slots[sid].chart_id > 0 && g_slots[sid].chart_id != ChartID())
-            ChartClose(g_slots[sid].chart_id);
-         g_slots[sid].chart_id = 0;
-         // Update dashboard selection if this slot was selected
-         if (g_selected_slot == sid) {
-            g_selected_slot = -1;
-            for (int k = 0; k < MAX_STRATEGIES; k++) {
-               if (g_slots[k].active) { g_selected_slot = k; break; }
-            }
+         // Close this slot's dedicated chart window (or clean up objects if on main chart)
+         if (g_slots[sid].chart_id > 0) {
+            if (g_slots[sid].chart_id != ChartID())
+               ChartClose(g_slots[sid].chart_id);
+            else
+               ObjectsDeleteAll(g_slots[sid].chart_id, OBJ_PREFIX + "INFO_");
          }
-         Print("[WS] strategy_delete S", sid, " — deactivated");
-         DrawDashboard();
+         g_slots[sid].chart_id = 0;
+         LOG("[WS] strategy_delete S", sid, " — deactivated");
       }
    }
    else {
-      Print("[WS] unhandled event=", event);
+      LOG("[WS] unhandled event=", event);
    }
 }
 
@@ -1217,7 +1230,7 @@ void HandleSignal(int sid, string res)
    string action = ExtractStr(res, "action");
    if (action == "" || action == "NONE") return;
    if (!g_slots[sid].enabled) {
-      Print("S", sid+1, " signal skipped (strategy disabled): ", action);
+      LOG("S", sid+1, " signal skipped (strategy disabled): ", action);
       return;
    }
 
@@ -1239,7 +1252,6 @@ void HandleSignal(int sid, string res)
 
    if (action == "EXIT") {
       CloseOrderByMagic(sym, magic);
-      DrawDashboard();
       return;
    }
 
@@ -1257,12 +1269,11 @@ void HandleSignal(int sid, string res)
                              ask - sl_pip*pt, ask + tp_pip*pt,
                              order_comment, magic, 0, clrBlue);
       if (ticket > 0) {
-         Print("S", sid, " BUY ", sym, " lot=", lot);
+         LOG("S", sid, " BUY ", sym, " lot=", lot);
          DrawSignalArrow(sid, "BUY", sym, s.tf);
-         DrawDashboard();
       } else {
          int err = GetLastError();
-         Print("S", sid, " BUY failed: ", err);
+         LOG("S", sid, " BUY failed: ", err);
          NotifyOrderFail(sid, "BUY", sym, lot, err);
       }
    }
@@ -1272,12 +1283,11 @@ void HandleSignal(int sid, string res)
                              bid + sl_pip*pt, bid - tp_pip*pt,
                              order_comment, magic, 0, clrRed);
       if (ticket > 0) {
-         Print("S", sid, " SELL ", sym, " lot=", lot);
+         LOG("S", sid, " SELL ", sym, " lot=", lot);
          DrawSignalArrow(sid, "SELL", sym, s.tf);
-         DrawDashboard();
       } else {
          int err = GetLastError();
-         Print("S", sid, " SELL failed: ", err);
+         LOG("S", sid, " SELL failed: ", err);
          NotifyOrderFail(sid, "SELL", sym, lot, err);
       }
    }
@@ -1388,7 +1398,7 @@ void LoadSlots()
       if (g_slots[i].active) {
          string detected = ParseSymbolFromPrompt(prompts[i]);
          if (StringLen(detected) > 0) {
-            Print("S", i, " symbol from prompt: ", detected);
+            LOG("S", i, " symbol from prompt: ", detected);
             g_slots[i].symbol = detected;
          }
          g_active++;
@@ -1414,8 +1424,8 @@ void CloseOrderByMagic(string sym, int magic)
                      ? MarketInfo(sym, MODE_BID)
                      : MarketInfo(sym, MODE_ASK);
       bool ok = OrderClose(OrderTicket(), OrderLots(), price, 3, clrYellow);
-      if (!ok) Print("CloseOrderByMagic failed ticket=", OrderTicket(), " err=", GetLastError());
-      else     Print("S", magic - MAGIC_BASE, " EXIT closed ticket=", OrderTicket());
+      if (!ok) LOG("CloseOrderByMagic failed ticket=", OrderTicket(), " err=", GetLastError());
+      else     LOG("S", magic - MAGIC_BASE, " EXIT closed ticket=", OrderTicket());
    }
 }
 
@@ -1526,7 +1536,7 @@ double CalcIndicator(IndConfig &c)
                                 c.custom_p[0],c.custom_p[1],c.custom_p[2],
                                 c.custom_p[3],c.custom_p[4],c.custom_p[5],
                                 c.buffer_index,sh);
-   Print("Unknown indicator: ", c.type);
+   LOG("Unknown indicator: ", c.type);
    return 0.0;
 }
 
@@ -1620,74 +1630,6 @@ void DrawSignalArrow(int sid, string action, string sym, int tf)
    ChartRedraw(cid);
 }
 
-//+------------------------------------------------------------------+
-//| Dashboard panel — top-left corner                                |
-//+------------------------------------------------------------------+
-void DrawDashboard()
-{
-   int x = 10, y = 20, line_h = 16;
-   color bg         = C'20,20,40';
-   color title_clr  = clrGold;
-   color active_clr = clrLimeGreen;
-   color off_clr    = clrDimGray;
-
-   // Background rectangle
-   string bg_name = OBJ_PREFIX + "PANEL_BG";
-   if (ObjectFind(bg_name) < 0)
-      ObjectCreate(bg_name, OBJ_RECTANGLE_LABEL, 0, 0, 0);
-   ObjectSet(bg_name, OBJPROP_CORNER,      CORNER_LEFT_UPPER);
-   ObjectSet(bg_name, OBJPROP_XDISTANCE,   x - 5);
-   ObjectSet(bg_name, OBJPROP_YDISTANCE,   y - 5);
-   ObjectSet(bg_name, OBJPROP_XSIZE,       320);
-   ObjectSet(bg_name, OBJPROP_YSIZE,       line_h * (MAX_STRATEGIES + 2) + 10);
-   ObjectSet(bg_name, OBJPROP_BGCOLOR,     bg);
-   ObjectSet(bg_name, OBJPROP_BORDER_TYPE, BORDER_FLAT);
-   ObjectSet(bg_name, OBJPROP_COLOR,       C'50,50,80');
-
-   // Title
-   string t_name = OBJ_PREFIX + "PANEL_TITLE";
-   if (ObjectFind(t_name) < 0)
-      ObjectCreate(t_name, OBJ_LABEL, 0, 0, 0);
-   ObjectSet(t_name, OBJPROP_CORNER,    CORNER_LEFT_UPPER);
-   ObjectSet(t_name, OBJPROP_XDISTANCE, x);
-   ObjectSet(t_name, OBJPROP_YDISTANCE, y);
-   ObjectSet(t_name, OBJPROP_COLOR,     title_clr);
-   ObjectSet(t_name, OBJPROP_FONTSIZE,  8);
-   ObjectSetString(0, t_name, OBJPROP_TEXT, "AI Trading Bridge v" + BRIDGE_VERSION);
-
-   // One row per strategy slot
-   for (int i = 0; i < MAX_STRATEGIES; i++) {
-      string row_name = OBJ_PREFIX + "PANEL_S" + IntegerToString(i);
-      if (ObjectFind(row_name) < 0)
-         ObjectCreate(row_name, OBJ_LABEL, 0, 0, 0);
-      ObjectSet(row_name, OBJPROP_CORNER,    CORNER_LEFT_UPPER);
-      ObjectSet(row_name, OBJPROP_XDISTANCE, x);
-      ObjectSet(row_name, OBJPROP_YDISTANCE, y + line_h * (i + 1) + 4);
-      ObjectSet(row_name, OBJPROP_FONTSIZE,  7);
-
-      if (g_slots[i].active) {
-         string sel    = (i == g_selected_slot) ? "► " : "  ";
-         string act    = (StringLen(g_slots[i].action) > 0) ? " ["+g_slots[i].action+"]" : "";
-         string on_off = g_slots[i].enabled ? "[ON] " : "[OFF]";
-         string label  = sel + "S" + IntegerToString(i+1) + " " + on_off + act + " "
-                       + g_slots[i].symbol + " " + TFtoStr(g_slots[i].tf)
-                       + " | " + StringSubstr(g_slots[i].prompt, 0, 22)
-                       + (StringLen(g_slots[i].prompt) > 22 ? "..." : "");
-         color row_clr = (i == g_selected_slot) ? clrGold :
-                         g_slots[i].enabled     ? active_clr : clrOrange;
-         ObjectSet(row_name, OBJPROP_COLOR,      row_clr);
-         ObjectSet(row_name, OBJPROP_SELECTABLE, true);  // cho phép click
-         ObjectSetString(0, row_name, OBJPROP_TEXT, label);
-      } else {
-         ObjectSet(row_name, OBJPROP_COLOR,      off_clr);
-         ObjectSet(row_name, OBJPROP_SELECTABLE, false);
-         ObjectSetString(0, row_name, OBJPROP_TEXT,
-            "  S" + IntegerToString(i+1) + " — (inactive)");
-      }
-   }
-
-   ChartRedraw();
-}
 
 //+------------------------------------------------------------------+
 //| Strategy info panel on auto-opened chart                         |
@@ -1841,24 +1783,15 @@ long OpenStrategyChart(int sid)
    string sym = g_slots[sid].symbol;
    int    tf  = g_slots[sid].tf;
 
-   // Không mở nếu đã là chart hiện tại
+   // Không mở nếu đã là chart hiện tại (main chart của EA)
    if (sym == Symbol() && tf == Period())
       return ChartID();
 
-   // Kiểm tra chart đã mở chưa — tránh mở trùng
-   long cid = ChartFirst();
-   int iter = 0;
-   while (cid >= 0) {
-      if (ChartSymbol(cid) == sym && ChartPeriod(cid) == tf)
-         return cid;
-      cid = ChartNext(cid);
-      if (++iter > 30) break;
-   }
-
-   // Mở chart mới
-   cid = ChartOpen(sym, tf);
+   // Mỗi slot cần chart riêng — không dùng lại chart của slot khác,
+   // kể cả khi cùng symbol+tf, vì panel/indicator sẽ bị đè.
+   long cid = ChartOpen(sym, tf);
    if (cid <= 0) {
-      Print("[AI Bridge] Cannot open chart S", sid+1, " ", sym, " ", TFtoStr(tf));
+      LOG("[AI Bridge] Cannot open chart S", sid+1, " ", sym, " ", TFtoStr(tf));
       return 0;
    }
 
@@ -1902,6 +1835,7 @@ void DrawIndicators(int sid, long cid)
    for (int k = 0; k < g_slots[sid].ind_count; k++) {
       IndConfig c  = g_slots[sid].inds[k];
       int       ap = (c.applied > 0) ? c.applied : PRICE_CLOSE;
+      tf = (c.timeframe > 0) ? c.timeframe : g_slots[sid].tf;
 
       // Skip *_prev variants — same line, just shifted; don't draw twice
       if (StringFind(c.name, "_prev") >= 0) continue;
@@ -1921,7 +1855,7 @@ void DrawIndicators(int sid, long cid)
               ObjectSetInteger(cid,_o,OBJPROP_RAY,       false); \
               ObjectSetInteger(cid,_o,OBJPROP_SELECTABLE,false); \
               _sd++; } \
-           total_drawn+=_sd; Print("DBG ",(pfx)," drew ",_sd," segs"); }
+           total_drawn+=_sd; }
 
       //── Helper: vẽ corner label (CORNER_RIGHT_UPPER, anchor RIGHT) ──
       // ANCHOR_RIGHT_UPPER: text extend sang TRÁI từ anchor point
@@ -2117,7 +2051,7 @@ void DrawIndicators(int sid, long cid)
       }
 
       else {
-         Print("[AI Bridge] Unknown indicator type: ", c.type);
+         LOG("[AI Bridge] Unknown indicator type: ", c.type);
       }
    }
 

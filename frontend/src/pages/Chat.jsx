@@ -112,6 +112,13 @@ const s = {
     justifyContent: 'center', color: '#64748b', flexShrink: 0,
     transition: 'background .15s',
   },
+  clearBtn: {
+    width: 32, height: 32, borderRadius: 8,
+    background: 'transparent', border: '1px solid #fecdd3',
+    cursor: 'pointer', display: 'flex', alignItems: 'center',
+    justifyContent: 'center', color: '#f87171', flexShrink: 0,
+    transition: 'background .15s',
+  },
   qrOverlay: {
     position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)',
     display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -283,6 +290,9 @@ export default function Chat() {
         if (data.event === 'chat_reply') {
           setMessages(m => [...m, { role: 'assistant', content: data.reply }])
           setLoading(false)
+        } else if (data.event === 'history_cleared') {
+          setMessages([])
+          setLoading(false)
         }
       } catch {
         // ignore malformed frames
@@ -378,6 +388,12 @@ export default function Chat() {
   const openQr  = useCallback(() => setShowQr(true),  [])
   const closeQr = useCallback(() => setShowQr(false), [])
 
+  const clearHistory = useCallback(() => {
+    const ws = wsRef.current
+    if (!ws || ws.readyState !== WebSocket.OPEN) return
+    ws.send(JSON.stringify({ event: 'clear_history' }))
+  }, [])
+
   // ── States ───────────────────────────────────────────────────────────
   if (status === 'verifying') return (
     <div style={s.center}><div>Verifying access...</div></div>
@@ -465,6 +481,14 @@ export default function Chat() {
           <span style={{ fontSize: 11, color: '#94a3b8', whiteSpace: 'nowrap' }}>
             Open on mobile
           </span>
+          <button style={s.clearBtn} onClick={clearHistory} title="Clear conversation history">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <polyline points="3 6 5 6 21 6"/>
+              <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+              <path d="M10 11v6M14 11v6"/>
+              <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
+            </svg>
+          </button>
         </div>
 
         {/* Messages */}

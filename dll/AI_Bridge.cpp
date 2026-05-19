@@ -15,6 +15,12 @@
 #define NOMINMAX
 #include <windows.h>
 #include <winhttp.h>
+
+// WINHTTP_WEB_SOCKET_PING_PONG_BUFFER_TYPE was added in SDK 8.1.
+// Cast the raw value so it compiles on both old (missing enum) and new (strongly-typed enum) SDKs.
+#ifndef WINHTTP_WEB_SOCKET_PING_PONG_BUFFER_TYPE
+#define WINHTTP_WEB_SOCKET_PING_PONG_BUFFER_TYPE static_cast<WINHTTP_WEB_SOCKET_BUFFER_TYPE>(9)
+#endif
 #include <string>
 #include <map>
 #include <vector>
@@ -700,7 +706,6 @@ struct Session {
 
 static std::map<int,Session> g_sessions;
 static std::mutex            g_mutex;
-static volatile bool         g_tick_debug = false;  // per-tick logging (off by default)
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // §11  Helpers
@@ -975,6 +980,7 @@ Bridge_Init(int sid, const wchar_t* prompt, const wchar_t* symbol,
             std::string o="{";
             o+="\"name\":\""        +JE(ind.str("name"))                    +"\",";
             o+="\"type\":\""        +JE(ind.str("type","iMA"))              +"\",";
+            o+="\"timeframe\":"     +I(ind.inum("timeframe",0))             +",";
             o+="\"period\":"        +I(ind.inum("period",14))               +",";
             o+="\"method\":"        +I(ind.inum("method",0))                +",";
             o+="\"applied\":"       +I(ind.inum("applied",0))               +",";
@@ -1053,39 +1059,6 @@ Bridge_Check(int sid, const wchar_t* values_json, int account,
     std::string vals_str = W2S(values_json);
     V vals=ParseValues(vals_str.c_str());
 
-    if (g_tick_debug) {
-        // ── Price snapshot ────────────────────────────────────────────────
-        char price_line[256];
-        _snprintf_s(price_line, sizeof(price_line), _TRUNCATE,
-            "TICK S%d %s │ ask=%.5f bid=%.5f │ O=%.5f H=%.5f L=%.5f C=%.5f",
-            sid + 1, s.symbol.c_str(),
-            vals.get("ask"), vals.get("bid"),
-            vals.O(0), vals.H(0), vals.L(0), vals.C(0));
-        Log(price_line);
-
-        // ── Indicator values (skip OHLCV and price keys) ──────────────────
-        std::string ind_line = "  INDS │";
-        static const std::string skip_prefixes[] = {
-            "open_","high_","low_","close_","volume_"
-        };
-        static const std::string skip_exact[] = {
-            "ask","bid","point"
-        };
-        for (auto& kv : vals.d) {
-            bool skip = false;
-            for (auto& p : skip_exact)
-                if (kv.first == p) { skip = true; break; }
-            if (!skip)
-                for (auto& p : skip_prefixes)
-                    if (kv.first.substr(0, p.size()) == p) { skip = true; break; }
-            if (skip) continue;
-            char buf[64];
-            _snprintf_s(buf, sizeof(buf), _TRUNCATE, " %s=%.5f", kv.first.c_str(), kv.second);
-            ind_line += buf;
-        }
-        Log(ind_line);
-    }
-
     // Exit condition evaluated first (higher priority than entry)
     if (s.exit_condition.get("type")) {
         bool should_exit = false;
@@ -1106,10 +1079,6 @@ Bridge_Check(int sid, const wchar_t* values_json, int account,
     catch(const std::exception& e){
         Log(std::string("EvalCond exception: ")+e.what());
         FillBuf("{\"action\":\"NONE\"}",out_buf,buf_size); return 0;
-    }
-
-    if (g_tick_debug) {
-        Log(std::string("  COND → ") + (signal ? "TRUE  *** SIGNAL ***" : "false"));
     }
 
     if(!signal){
@@ -1151,18 +1120,7 @@ Bridge_GetLastLog(char* out_buf, int buf_size) {
     return (int)g_last_debug.size();
 }
 
-// Enable/disable per-tick logging in Bridge_Check.
-// enable=1 → log every tick (price snapshot + indicators + condition result)
-// enable=0 → silent (default, production mode)
-// WARNING: only enable during debugging — generates large log files on live accounts.
-__declspec(dllexport) void __stdcall
-Bridge_SetDebug(int enable)
-{
-    g_tick_debug = (enable != 0);
-    Log(std::string("Bridge_SetDebug → tick_debug=") + (g_tick_debug ? "ON" : "OFF"));
-}
-
-} // extern "C"  — closes Bridge_Init/Check/Stop/Version/GetLastLog/SetDebug
+} // extern "C"  — closes Bridge_Init/Check/Stop/Version/GetLastLog
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // §WS  WebSocket helpers — OUTSIDE extern "C" so std::string return is valid
@@ -1340,6 +1298,12 @@ static bool WsDoConnect() {
     WinHttpCloseHandle(hReq);
     if (!g_ws_hWs) WS_FAIL("WinHttpWebSocketCompleteUpgrade failed");
 
+    // Heartbeat: receive timeout 30s so WsThreadProc wakes up to send a ping
+    // and detects silent disconnects (firewall/NAT state loss, no TCP RST)
+    DWORD recvTimeout = 30000;
+    WinHttpSetOption(g_ws_hWs, WINHTTP_OPTION_RECEIVE_TIMEOUT,
+                     &recvTimeout, sizeof(recvTimeout));
+
     // SUCCESS
     g_ws_connected = true;
     g_ws_reconnect_cnt++;
@@ -1360,6 +1324,15 @@ static bool WsSend(const std::string& msg) {
         (PVOID)msg.c_str(), (DWORD)msg.size());
     if (ret != ERROR_SUCCESS)
         Log("WsSend error=" + std::to_string(ret));
+    return ret == ERROR_SUCCESS;
+}
+
+// Send a WebSocket ping frame to verify the connection is still alive
+static bool WsPing() {
+    std::lock_guard<std::mutex> lk(g_ws_connmtx);
+    if (!g_ws_hWs) return false;
+    DWORD ret = WinHttpWebSocketSend(
+        g_ws_hWs, WINHTTP_WEB_SOCKET_PING_PONG_BUFFER_TYPE, nullptr, 0);
     return ret == ERROR_SUCCESS;
 }
 
@@ -1405,6 +1378,18 @@ static DWORD WINAPI WsThreadProc(LPVOID) {
         DWORD ret = WinHttpWebSocketReceive(g_ws_hWs, buf, sizeof(buf), &got, &btype);
 
         if (!g_ws_running) break;
+
+        if (ret == ERROR_WINHTTP_TIMEOUT) {
+            // Receive timeout (30s) — send ping to detect silent disconnects
+            if (WsPing()) continue;   // connection alive, keep receiving
+            // Ping failed → silent disconnect (NAT/firewall dropped the session)
+            g_ws_connected = false;
+            { std::lock_guard<std::mutex> lk(g_ws_connmtx); g_ws_last_error = "ping failed — silent disconnect"; }
+            Log("WS: ping failed — silent disconnect, reconnecting in 3s");
+            WinHttpCloseHandle(g_ws_hWs); g_ws_hWs = nullptr;
+            Sleep(3000);
+            continue;
+        }
 
         if (ret != ERROR_SUCCESS) {
             g_ws_connected = false;
@@ -1587,18 +1572,9 @@ Bridge_Register(int account, const wchar_t* server_broker, int license_type,
     Log("=== Bridge_Register account="+std::to_string(account)
         +" lic="+std::to_string(license_type));
 
-    // LICENSE_FREE (0) → không có bản quyền, dừng ngay
-    if (license_type == 0) {
-        FillBuf("{\"status\":\"error\","
-                "\"message\":\"No license. Please purchase on MQL5 Market.\"}",
-                out_buf, buf_size);
-        Log("LICENSE_FREE → rejected, no backend call");
-        return -1;
-    }
-
     // Map license int → string
     static const char* lic_names[] = {"FREE","DEMO","FULL","TIME"};
-    std::string lic_str = (license_type>=1&&license_type<=3)
+    std::string lic_str = (license_type>=0&&license_type<=3)
                           ? lic_names[license_type] : "UNKNOWN";
 
     std::string acc_str = std::to_string(account);

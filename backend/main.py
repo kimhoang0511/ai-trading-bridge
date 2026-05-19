@@ -25,7 +25,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from auth import create_token, decode_token
-from config import HOST, PORT
+from config import HOST, PORT, WHITELISTED_ACCOUNTS
 from database import SessionLocal, User, Strategy, init_db, get_db
 
 logging.basicConfig(
@@ -41,7 +41,7 @@ ws_chat_clients: dict = {}   # account_number → WebSocket (Frontend)
 
 # ── Server-side conversation history (prevents client history injection) ──────
 _conv_store: dict = {}          # account_number → [{"role", "content"}, ...]
-strategy_store: dict = {}       # account_number → {sid: {prompt,lot,sl,tp,tf,action,symbol}}
+_strategy_list_pending: dict = {}  # account_number → asyncio.Future (strategy_list_request)
 _CONV_MAX     = 20              # max messages kept per account
 _MSG_MAX_LEN  = 2000            # max chars per user message
 _RATE_WINDOW  = 60              # seconds
@@ -61,7 +61,6 @@ CHAT_ORDER_MAGIC = 20250518           # magic number for chat-opened orders
 
 _ea_pending: dict = {}                # account_number → asyncio.Future (order request/response)
 _account_locks: dict = {}             # account_number → asyncio.Lock (prevent concurrent CRUD)
-_context_cache: dict = {}             # account_number → (version_key, context_str)
 _WS_MSG_MAX_BYTES = 65_536            # 64 KB hard limit per WS message
 
 
@@ -86,40 +85,62 @@ def _conv_update_last_assistant(account: str, new_content: str) -> None:
             return
 
 
-def _strategy_store_save(account: str, sid: int, data: dict) -> None:
-    strategy_store.setdefault(account, {})[sid] = data
-    _context_cache.pop(account, None)
-
-
-def _strategy_store_delete(account: str, sid: int) -> None:
-    strategy_store.get(account, {}).pop(sid, None)
-    _context_cache.pop(account, None)
-
-
-def _strategy_context(account: str) -> str:
-    """Build a strategy summary string to inject into Claude's system prompt (cached)."""
-    if account in _context_cache:
-        return _context_cache[account]
-    ss = strategy_store.get(account, {})
-    if not ss:
-        result = "Current strategies in EA: none configured yet."
-        _context_cache[account] = result
+async def _fetch_strategy_list(account: str, timeout: float = 3.0) -> dict:
+    """Ask the EA for a live snapshot of all active strategy slots.
+    Returns {sid: {prompt, lot, sl, tp, tf, action, symbol, enabled}} or {} if EA offline."""
+    ws = ws_ea_clients.get(account)
+    if not ws:
+        return {}
+    loop = asyncio.get_event_loop()
+    fut: asyncio.Future = loop.create_future()
+    _strategy_list_pending[account] = fut
+    try:
+        await ws.send_json({"event": "strategy_list_request"})
+        data = await asyncio.wait_for(asyncio.shield(fut), timeout=timeout)
+        result: dict = {}
+        for s in data.get("strategies", []):
+            sid = int(s.get("sid", -1))
+            if 0 <= sid <= 4:
+                result[sid] = {
+                    "prompt":  s.get("prompt", ""),
+                    "lot":     float(s.get("lot", 0.1)),
+                    "sl":      int(s.get("sl", 50)),
+                    "tp":      int(s.get("tp", 100)),
+                    "tf":      int(s.get("tf", 0)),
+                    "action":  s.get("action", "BUY"),
+                    "symbol":  s.get("symbol", ""),
+                    "enabled": bool(s.get("enabled", 0)),
+                }
         return result
+    except Exception:
+        return {}
+    finally:
+        _strategy_list_pending.pop(account, None)
+
+
+async def _strategy_context(account: str) -> str:
+    """Build a strategy summary string to inject into Claude's system prompt (live from EA)."""
+    if account not in ws_ea_clients:
+        return (
+            "⚠️ EA IS OFFLINE — strategy data is unavailable.\n"
+            "Do NOT reference any strategy information from conversation history.\n"
+            "Tell the user the EA is disconnected and you cannot show strategy details."
+        )
+    ss = await _fetch_strategy_list(account)
+    if not ss:
+        return "Current strategies in EA: none configured yet."
     tf_map = {0:"auto",1:"M1",5:"M5",15:"M15",30:"M30",60:"H1",240:"H4",1440:"D1",10080:"W1"}
     lines = ["Current strategies in EA:"]
     for sid in sorted(ss):
         s       = ss[sid]
         tf      = tf_map.get(int(s.get("tf", 0)), str(s.get("tf", 0)))
-        enabled = s.get("enabled", True)
-        status  = "ON" if enabled else "OFF"
+        status  = "ON" if s.get("enabled", True) else "OFF"
         lines.append(
             f"  S{sid+1} (sid={sid}) [{status}]: {s.get('action','?')} {s.get('symbol','?')} {tf}"
             f" | lot={s.get('lot',0.1)} SL={s.get('sl',50)} TP={s.get('tp',100)}"
             f" | prompt: \"{s.get('prompt','')[:80]}\""
         )
-    result = "\n".join(lines)
-    _context_cache[account] = result
-    return result
+    return "\n".join(lines)
 
 
 def _rate_check(account: str) -> bool:
@@ -158,10 +179,8 @@ async def _cleanup_stale():
         stale = [a for a, t in list(_last_activity.items()) if now - t > _STALE_TTL]
         for a in stale:
             _conv_store.pop(a, None)
-            strategy_store.pop(a, None)
             _rate_counters.pop(a, None)
             _last_activity.pop(a, None)
-            _context_cache.pop(a, None)
             _account_locks.pop(a, None)
         # Also prune _rate_counters keys for accounts that never appeared in _last_activity
         for a in list(_rate_counters.keys()):
@@ -243,11 +262,14 @@ async def register(request: Request, db: Session = Depends(get_db)):
             status_code=400,
         )
 
-    if license_type not in VALID_LICENSES:
+    if account_number not in WHITELISTED_ACCOUNTS and license_type not in VALID_LICENSES:
         return JSONResponse(
             {"status": "error", "message": f"Invalid license_type '{license_type}'. Must be DEMO, FULL or TIME."},
             status_code=400,
         )
+
+    if account_number in WHITELISTED_ACCOUNTS and license_type not in VALID_LICENSES:
+        license_type = "FULL"
 
     # ── Upsert ────────────────────────────────────────────────────────────
     token = create_token(account_number, server_broker, license_type)
@@ -277,6 +299,9 @@ async def register(request: Request, db: Session = Depends(get_db)):
         user.updated_at = now
         db.commit()
         logger.info(f"OK   {account_number}@{server_broker} [{license_type}]")
+
+    # EA restart → clear stale conversation history so Claude starts fresh
+    _conv_store.pop(account_number, None)
 
     return {"status": "ok", "token": token, "license_type": license_type}
 
@@ -371,6 +396,17 @@ OUTPUT FORMAT (return ONLY valid JSON, no markdown, no explanation):
     ]
   }
 }
+
+MULTI-TIMEFRAME (MTF) INDICATORS:
+When a strategy uses indicators from different timeframes, ALWAYS set explicit "timeframe" on EVERY indicator.
+Never omit "timeframe" in MTF strategies — always write it explicitly for every indicator, even if it matches the main "tf".
+Valid values: 1, 5, 15, 30, 60, 240, 1440.
+Naming convention: append the TF label to the indicator name (e.g. ma50_h4, rsi14_h1).
+Example: MA50 on H4 and RSI14 on H1, strategy tf=60:
+  {"name":"ma50_h4","type":"iMA","period":50,"method":1,"applied":0,"shift":0,"timeframe":240}
+  {"name":"rsi14_h1","type":"iRSI","period":14,"applied":0,"shift":0,"timeframe":60}
+MTF crossover: also include _prev variant with the same "timeframe":
+  {"name":"ma50_h4_prev","type":"iMA","period":50,"method":1,"applied":0,"shift":1,"timeframe":240}
 
 INDICATOR TYPES and REQUIRED FIELDS:
 - iMA:         {"name":"ma20","type":"iMA","period":20,"method":1,"applied":0,"shift":0}
@@ -474,9 +510,14 @@ CRITICAL RULES:
    DLL clamps automatically if ohlc_bars is too small, but the lookback is reduced.
    Always set ohlc_bars to the exact value required. MAX ohlc_bars = 50.
 8. exit_condition: ALWAYS include this field. If the instruction mentions an explicit exit/close condition, parse it here using the same indicator variable names from indicators array. If no explicit exit is mentioned, infer a logical reversal: for a BUY entry using crossover X>Y, the exit is X<Y crossover. If no reversal can be inferred, output "exit_condition": {} (empty = rely on SL/TP only).
-9. MAX indicators: 15. If more are needed, keep only the most essential ones.
-10. Only use FN names from the PA FUNCTIONS list above. NEVER invent function names.
-11. UNSUPPORTED strategies: If the strategy requires something this system cannot model
+9. MULTI-TF: When instruction mentions different timeframes for different indicators, set explicit "timeframe" on EVERY indicator.
+   - The strategy-level "tf" = the entry/signal timeframe (lowest TF used for entry).
+   - ALL indicators must carry explicit "timeframe" — both higher-TF and same-TF ones.
+   - Example: "buy when H4 MA50 is bullish AND H1 RSI < 30" → tf=60, ma50_h4 has timeframe=240, rsi14 has timeframe=60.
+   - Never omit "timeframe" in MTF strategies, even for indicators matching the main tf.
+10. MAX indicators: 15. If more are needed, keep only the most essential ones.
+11. Only use FN names from the PA FUNCTIONS list above. NEVER invent function names.
+12. UNSUPPORTED strategies: If the strategy requires something this system cannot model
     (news/fundamentals, sentiment, ML predictions, custom/proprietary indicators, inter-symbol
     correlation, order flow, or any condition not expressible as indicator CMP/FN logic),
     output ONLY: {"action":"UNSUPPORTED","reason":"<one sentence English explanation>"}
@@ -499,23 +540,17 @@ _FEW_SHOT_ASST = ('{"action":"BUY","tf":0,"lot":0.1,"sl_pip":40,"tp_pip":80,"ohl
                   '"exit_condition":{"type":"AND","args":['
                   '{"type":"CMP","left":"ema20","op":"<","right":"ema50"},'
                   '{"type":"CMP","left":"ema20_prev","op":">","right":"ema50_prev"}]}}')
-_FEW_SHOT_USER2 = ('Instruction: "Sell USDJPY H4 when MACD crosses below signal and Stochastic > 80. SL 30, TP 60"\n'
-                   'Symbol: USDJPY\nDefault lot: 0.100000, SL: 30 pips, TP: 60 pips')
-_FEW_SHOT_ASST2 = ('{"action":"SELL","tf":240,"lot":0.1,"sl_pip":30,"tp_pip":60,"ohlc_bars":2,'
+_FEW_SHOT_USER2 = ('Instruction: "Buy EURUSD H1 when MA50 on H4 is bullish (price above MA50) AND RSI14 on H1 < 35. SL 40, TP 80"\n'
+                   'Symbol: EURUSD\nDefault lot: 0.100000, SL: 40 pips, TP: 80 pips, TF: 60 min')
+_FEW_SHOT_ASST2 = ('{"action":"BUY","tf":60,"lot":0.1,"sl_pip":40,"tp_pip":80,"ohlc_bars":2,'
+                   '"symbol":"EURUSD",'
                    '"indicators":['
-                   '{"name":"macd_main","type":"iMACD","fast":12,"slow":26,"signal":9,"applied":0,"line":0,"shift":0},'
-                   '{"name":"macd_main_prev","type":"iMACD","fast":12,"slow":26,"signal":9,"applied":0,"line":0,"shift":1},'
-                   '{"name":"macd_sig","type":"iMACD","fast":12,"slow":26,"signal":9,"applied":0,"line":1,"shift":0},'
-                   '{"name":"macd_sig_prev","type":"iMACD","fast":12,"slow":26,"signal":9,"applied":0,"line":1,"shift":1},'
-                   '{"name":"sto_k","type":"iStochastic","kperiod":5,"dperiod":3,"slowing":3,"method":0,"line":0,"shift":0}],'
+                   '{"name":"ma50_h4","type":"iMA","period":50,"method":1,"applied":0,"shift":0,"timeframe":240},'
+                   '{"name":"rsi14_h1","type":"iRSI","period":14,"applied":0,"shift":0,"timeframe":60}],'
                    '"condition":{"type":"AND","args":['
-                   '{"type":"AND","args":['
-                   '{"type":"CMP","left":"macd_main","op":"<","right":"macd_sig"},'
-                   '{"type":"CMP","left":"macd_main_prev","op":">","right":"macd_sig_prev"}]},'
-                   '{"type":"CMP","left":"sto_k","op":">","right":80}]},'
-                   '"exit_condition":{"type":"AND","args":['
-                   '{"type":"CMP","left":"macd_main","op":">","right":"macd_sig"},'
-                   '{"type":"CMP","left":"macd_main_prev","op":"<","right":"macd_sig_prev"}]}}')
+                   '{"type":"CMP","left":"close_0","op":">","right":"ma50_h4"},'
+                   '{"type":"CMP","left":"rsi14_h1","op":"<","right":35}]},'
+                   '"exit_condition":{"type":"CMP","left":"close_0","op":"<","right":"ma50_h4"}}')
 
 async def _call_init_claude(
     prompt: str,
@@ -529,9 +564,10 @@ async def _call_init_claude(
     if not CLAUDE_API_KEY or _claude is None:
         return None
     import json as _json
+    tf_hint = f", TF: {tf} min" if tf and tf > 0 else ""
     user_msg = (f'Instruction: "{prompt}"\n'
                 f'Symbol: {symbol or "EURUSD"}\n'
-                f'Default lot: {lot:.6f}, SL: {sl} pips, TP: {tp} pips')
+                f'Default lot: {lot:.6f}, SL: {sl} pips, TP: {tp} pips{tf_hint}')
     try:
         resp = await asyncio.wait_for(
             _claude.messages.create(
@@ -660,7 +696,15 @@ def _validate_strategy_config(config: dict) -> "tuple[bool, str]":
     _collect_condition_vars(cond, used_vars)
     if isinstance(exit_cond, dict) and exit_cond.get("type"):
         _collect_condition_vars(exit_cond, used_vars)
-    missing_ind = used_vars - ind_names
+
+    # OHLC bars and fixed market vars are always available — not declared as indicators
+    ohlc_bars = config.get("ohlc_bars", 5)
+    builtin_vars: set = {"ask", "bid", "point", "spread", "time", "bar_time"}
+    for _i in range(ohlc_bars + 2):
+        for _pfx in ("open_", "high_", "low_", "close_", "volume_"):
+            builtin_vars.add(f"{_pfx}{_i}")
+
+    missing_ind = used_vars - ind_names - builtin_vars
     if missing_ind:
         return False, f"unknown_indicators:{','.join(sorted(missing_ind))}"
 
@@ -710,7 +754,7 @@ def _strip_execute(text: str) -> str:
 
 _TF_MAP = {0:"auto",1:"M1",5:"M5",15:"M15",30:"M30",60:"H1",240:"H4",1440:"D1",10080:"W1"}
 
-def _format_strategy_summary(acct: str, sid: int, op: str, ea_connected: bool,
+def _format_strategy_summary(new_values: dict, sid: int, op: str, ea_connected: bool,
                               old_values: "dict | None" = None) -> str:
     """Return a formatted strategy card to append after a successful add/update/delete."""
     slot_name = f"S{sid + 1}"
@@ -720,7 +764,7 @@ def _format_strategy_summary(acct: str, sid: int, op: str, ea_connected: bool,
             msg += " ⚠️ EA not connected — will sync on reconnect."
         return f"\n\n---\n{msg}"
 
-    s      = strategy_store.get(acct, {}).get(sid, {})
+    s      = new_values
     tf_new = _TF_MAP.get(int(s.get("tf", 0)), str(s.get("tf", 0)))
     status = "✅" if ea_connected else "💾"
     lines  = [f"{status} **{slot_name} – {s.get('action','?')} {s.get('symbol','?')} ({tf_new})**"]
@@ -1080,17 +1124,6 @@ async def strategy_init(request: Request, db: Session = Depends(get_db)):
     if config is None:
         return JSONResponse({"status": "error", "message": "Claude parse failed"}, status_code=500)
 
-    # Persist strategy so chat bot can answer "what is Strategy X?"
-    _strategy_store_save(str(account), sid, {
-        "prompt": prompt,
-        "lot":    config.get("lot",    lot),
-        "sl":     config.get("sl_pip", sl),
-        "tp":     config.get("tp_pip", tp),
-        "tf":     config.get("tf",     tf),
-        "action": config.get("action", "BUY"),
-        "symbol": config.get("symbol", symbol),
-    })
-
     logger.info(f"Init S{sid} account={account} symbol={symbol} action={config.get('action')} tf={config.get('tf')}")
     return {"status": "ok", "config": config}
 
@@ -1182,7 +1215,7 @@ S1 (sid=0) · S2 (sid=1) · S3 (sid=2) · S4 (sid=3) · S5 (sid=4)
 
 Append EXACTLY ONE of these at the very end of your reply (nothing after it):
 
-  [EXECUTE:{"op":"add","sid":N,"prompt":"<English description>","lot":0.1,"sl":50,"tp":100,"tf":0}]
+  [EXECUTE:{"op":"add","sid":N,"prompt":"<English description>","lot":0.1,"sl":50,"tp":100,"tf":0,"enabled":true}]
   [EXECUTE:{"op":"update","sid":N,"lot":0.2}]
   [EXECUTE:{"op":"update","sid":N,"prompt":"<new English description>","sl":30}]
   [EXECUTE:{"op":"update","sid":N,"enabled":false}]
@@ -1194,7 +1227,24 @@ Rules:
 - tf in minutes: M1=1 M5=5 M15=15 M30=30 H1=60 H4=240 D1=1440 (0 if not specified)
 - "update": only include the changed fields + sid
 - "delete": only include sid
+- For "add": include `"enabled":false` if user says "enable=off", "disabled", "tắt", "không bật", etc.; default is `"enabled":true`
 - Do NOT wrap [EXECUTE] in markdown, quotes, or code blocks
+
+## MULTI-TIMEFRAME (MTF) STRATEGIES
+
+Users often intentionally combine indicators from DIFFERENT timeframes in ONE strategy.
+This is a valid, common trading technique — do NOT treat it as ambiguous or ask for clarification.
+
+Examples of valid MTF prompts:
+- "Buy XAUUSD H1 when MA50 on H4 is bullish AND RSI14 on H1 < 40"
+- "Sell EURUSD when price breaks below MA200 on D1 and MACD on H4 crosses bearish"
+- "Buy when MA20 crosses above MA50 on H4, AND RSI14 on H1 < 40"
+
+Rules for MTF:
+- Set `tf` = the ENTRY/SIGNAL timeframe (lowest TF mentioned, e.g. H1=60)
+- Keep the FULL description in `prompt` — the strategy parser handles per-indicator TFs automatically
+- NEVER ask "which timeframe do you want to use?" when the user explicitly specifies different TFs for different indicators
+- NEVER split a MTF strategy into multiple strategies
 
 ## ORDER MANAGEMENT
 
@@ -1238,8 +1288,7 @@ Order [EXECUTE] formats:
   [EXECUTE:{"op":"order_history_48h"}]
 
 Notes:
-- "Chat-managed orders" = orders opened through this chat (tracked by magic number).
-  You cannot close or modify orders opened automatically by EA strategies.
+- CLOSE ALL and LIST cover ALL open orders — both chat-opened and EA strategy orders.
 - Confirm before OPEN / CLOSE / CLOSE ALL / MODIFY — same rules as strategy CRUD.
 - LIST, HISTORY LAST N, and HISTORY 48H do not require confirmation — emit [EXECUTE] immediately.
 - If user specifies a count ("last 10 orders", "последние 5 ордеров", "最近10笔", "últimas 10 órdenes") → use `order_history_last` with that limit.
@@ -1356,6 +1405,14 @@ When you see such a result in history:
 - If it shows a failure, offer to retry or suggest next steps
 - Do NOT re-emit [EXECUTE] for the same operation unless the user explicitly requests a retry
 
+## ⚠️ REAL-TIME DATA — ABSOLUTE RULES (NEVER skip, NEVER override)
+
+The following data categories are ALWAYS real-time. They change tick-by-tick or trade-by-trade.
+**You MUST fetch them live via [EXECUTE] EVERY TIME the user asks.**
+**NEVER answer these from conversation history, even if a previous message contains similar data.**
+**Conversation history is a log of past interactions — it is NOT a live data source.**
+If you cannot emit [EXECUTE] (e.g. EA is offline), say so explicitly. Do NOT guess or paraphrase old values.
+
 **CRITICAL — live order queries:**
 When the user asks about CURRENT open orders — e.g.
   EN: "show orders", "what orders do I have", "list orders", "open positions"
@@ -1363,20 +1420,25 @@ When the user asks about CURRENT open orders — e.g.
   ZH: "当前订单", "持仓"
   ES: "órdenes abiertas", "posiciones"
   PT: "ordens abertas", "posições"
+  AR: "الأوامر المفتوحة", "عرض الصفقات", "المراكز الحالية"
+  ID: "order yang terbuka", "posisi saat ini", "daftar order"
 — you MUST emit `[EXECUTE:{"op":"order_list"}]` immediately — do NOT answer from history.
-Order state (P&L, SL, TP) changes every tick; history is stale. No confirmation needed.
+Order state (P&L, SL, TP) changes every tick; history is always stale. No confirmation needed.
 
 **CRITICAL — order history queries:**
 When the user asks about PAST/CLOSED orders — e.g.
-  EN: "order history", "last 10 orders", "closed orders", "orders today"
+  EN: "order history", "last 10 orders", "closed orders", "orders today", "trade history"
   RU: "история ордеров", "последние 10 ордеров"
   ZH: "订单历史", "最近10笔"
   ES: "historial de órdenes", "últimas 10 órdenes"
   PT: "histórico de ordens", "últimas 10 ordens"
+  AR: "سجل الأوامر", "آخر 10 صفقات", "الصفقات المغلقة", "تاريخ التداول"
+  ID: "riwayat order", "10 order terakhir", "order yang ditutup", "history trading"
 — emit the appropriate [EXECUTE] immediately. Do NOT answer from history. Rules:
 - Specific count → `[EXECUTE:{"op":"order_history_last","limit":N}]`
 - Unspecified / "today" / "48h" → `[EXECUTE:{"op":"order_history_48h"}]`
 No confirmation needed.
+⛔ NEVER summarize or quote order history from a previous assistant message — that data is stale the moment the message was written.
 
 **CRITICAL — market data queries:**
 When the user asks about price, indicator values, candles, spread, or any live market data — e.g.
@@ -1385,17 +1447,23 @@ When the user asks about price, indicator values, candles, spread, or any live m
   ZH: "欧元美元价格", "RSI14 H1", "黄金当前价", "H4 K线"
   ES: "precio EURUSD", "RSI14 en H1", "precio actual del oro"
   PT: "preço EURUSD", "RSI14 H1", "preço atual do ouro"
-— ALWAYS emit market_query [EXECUTE] immediately. Do NOT make up values. Fetch live data first.
+  AR: "سعر اليورو دولار", "مؤشر RSI14 H1", "سعر الذهب الحالي", "شمعة H4"
+  ID: "harga EURUSD", "RSI14 H1", "harga emas sekarang", "candle H4 terbaru", "spread saat ini"
+— ALWAYS emit market_query [EXECUTE] immediately. Do NOT make up values or repeat values from history. Fetch live data first.
 No confirmation needed.
+⛔ NEVER state a price, RSI value, MA value, or any indicator value from memory or conversation history.
 
 **CRITICAL — live strategy queries:**
 When the user asks about current strategies — e.g.
-  EN: "list strategies", "what strategies are active", "show S1"
+  EN: "list strategies", "what strategies are active", "show S1", "strategy status"
   RU: "список стратегий", "активные стратегии"
   ZH: "策略列表", "当前策略"
   ES: "listar estrategias", "estrategias activas"
-— answer using ONLY the `## CURRENT EA STRATEGIES` context injected into the system prompt.
-It is always fresh. Do NOT reconstruct from conversation history.
+  AR: "قائمة الاستراتيجيات", "الاستراتيجيات النشطة", "عرض S1"
+  ID: "daftar strategi", "strategi yang aktif", "tampilkan S1"
+— answer using ONLY the `## CURRENT EA STRATEGIES` context injected at the top of this system prompt.
+That block is fetched live from EA on every message. Do NOT reconstruct from conversation history.
+⛔ If the `## CURRENT EA STRATEGIES` block says EA is offline, tell the user — do NOT quote old strategy data from history.
 
 **CRITICAL — enable/disable (no confirmation needed):**
 When the user wants to disable a strategy — e.g.
@@ -1550,7 +1618,7 @@ async def _handle_chat_http(message: str, user: "User") -> JSONResponse:
                     {"type": "text", "text": STRATEGY_SYSTEM_PROMPT,
                      "cache_control": {"type": "ephemeral"}},
                     {"type": "text", "text": "\n\n## CURRENT EA STRATEGIES\n"
-                                             + _strategy_context(user.account_number)},
+                                             + await _strategy_context(user.account_number)},
                 ],
                 messages=messages,
             ),
@@ -1657,8 +1725,9 @@ async def _handle_chat_http(message: str, user: "User") -> JSONResponse:
         ea_connected = user.account_number in ws_ea_clients
 
         # Track outcome: "sent" | "no_ea" | "parse_error" | "error"
-        crud_result = "no_op"
-        crud_error  = ""
+        crud_result    = "no_op"
+        crud_error     = ""
+        crud_new_values: dict = {}
 
         acct = user.account_number
         try:
@@ -1684,6 +1753,7 @@ async def _handle_chat_http(message: str, user: "User") -> JSONResponse:
                         resolved_lot = config.get("lot",       lot)
                         resolved_sl  = config.get("sl_pip",    sl)
                         resolved_tp  = config.get("tp_pip",    tp)
+                        new_enabled  = bool(action.get("enabled", True))
                         payload: dict = {
                             "event": "strategy_add",
                             "sid":   sid,
@@ -1694,30 +1764,31 @@ async def _handle_chat_http(message: str, user: "User") -> JSONResponse:
                                 "sl":         resolved_sl,
                                 "tp_pip":     resolved_tp,
                                 "tp":         resolved_tp,
-                                "tf":         config.get("tf",        tf),
+                                "tf":         config.get("tf") or tf,
                                 "action":     config.get("action",    "BUY"),
                                 "symbol":     config.get("symbol",    ""),
                                 "ohlc_bars":  config.get("ohlc_bars", 3),
                                 "indicators":      config.get("indicators",      []),
                                 "condition":       config.get("condition",       {}),
                                 "exit_condition":  config.get("exit_condition",  {}),
+                                "enabled":    1 if new_enabled else 0,
                             }
                         }
-                        _strategy_store_save(acct, sid, {
+                        crud_new_values = {
                             "prompt":  prompt_str,
                             "lot":     resolved_lot,
                             "sl":      resolved_sl,
                             "tp":      resolved_tp,
-                            "tf":      config.get("tf",     tf),
+                            "tf":      config.get("tf") or tf,
                             "action":  config.get("action", "BUY"),
                             "symbol":  config.get("symbol", ""),
-                            "enabled": True,
-                        })
+                            "enabled": new_enabled,
+                        }
                         await ws_broadcast(acct, payload)
                         crud_result = "sent" if ea_connected else "no_ea"
 
             elif op == "update":
-                existing = strategy_store.get(acct, {}).get(sid, {})
+                existing = (await _fetch_strategy_list(acct)).get(sid, {})
                 if "prompt" in action:
                     # Prompt changed → re-parse condition tree
                     new_prompt = action["prompt"]
@@ -1753,7 +1824,7 @@ async def _handle_chat_http(message: str, user: "User") -> JSONResponse:
                                     "sl":         resolved_sl,
                                     "tp_pip":     resolved_tp,
                                     "tp":         resolved_tp,
-                                    "tf":         config.get("tf",        new_tf),
+                                    "tf":         config.get("tf") or new_tf,
                                     "action":     config.get("action",    "BUY"),
                                     "symbol":     config.get("symbol",    new_sym),
                                     "ohlc_bars":  config.get("ohlc_bars", 3),
@@ -1762,36 +1833,34 @@ async def _handle_chat_http(message: str, user: "User") -> JSONResponse:
                                     "exit_condition":  config.get("exit_condition",  {}),
                                 }
                             }
-                            _strategy_store_save(acct, sid, {
+                            crud_new_values = {
                                 "prompt":  new_prompt,
                                 "lot":     resolved_lot,
                                 "sl":      resolved_sl,
                                 "tp":      resolved_tp,
-                                "tf":      config.get("tf",     new_tf),
+                                "tf":      config.get("tf") or new_tf,
                                 "action":  config.get("action", "BUY"),
                                 "symbol":  config.get("symbol", new_sym),
                                 "enabled": existing.get("enabled", True),
-                            })
+                            }
                             await ws_broadcast(acct, payload)
                             crud_result = "sent" if ea_connected else "no_ea"
                 else:
                     # Parameters only (lot/sl/tp/tf/enabled) → partial update
                     upd: dict = {"event": "strategy_update", "sid": sid}
-                    store_upd: dict = {}
+                    crud_new_values = dict(existing)
                     for k in ("lot", "sl", "tp", "tf"):
                         if k in action:
                             upd[k] = action[k]
-                            store_upd[k] = action[k]
+                            crud_new_values[k] = action[k]
                     if "enabled" in action:
                         en = bool(action["enabled"])
                         upd["enabled"] = 1 if en else 0   # EA reads as number
-                        store_upd["enabled"] = en
-                    _strategy_store_save(acct, sid, {**existing, **store_upd})
+                        crud_new_values["enabled"] = en
                     await ws_broadcast(acct, upd)
                     crud_result = "sent" if ea_connected else "no_ea"
 
             elif op == "delete":
-                _strategy_store_delete(acct, sid)
                 await ws_broadcast(acct, {"event": "strategy_delete", "sid": sid})
                 crud_result = "sent" if ea_connected else "no_ea"
 
@@ -1818,7 +1887,7 @@ async def _handle_chat_http(message: str, user: "User") -> JSONResponse:
             reply += f"\n\n❌ `ea_error:{crud_error}`"
         elif crud_result in ("no_ea", "sent"):
             reply += _format_strategy_summary(
-                user.account_number, sid, op, ea_connected=(crud_result == "sent"),
+                crud_new_values, sid, op, ea_connected=(crud_result == "sent"),
                 old_values=existing if op == "update" else None,
             )
 
@@ -1873,66 +1942,32 @@ async def ws_ea_connect(
                 await ws.send_json({"event": "pong"})
 
             elif event == "strategy_hello":
-                # DLL sends all active sessions on connect — merge into strategy_store
-                # Backend is source of truth: only fill slots not already stored
-                # (preserves chat-based lot/sl/tp modifications across EA restarts)
+                # DLL sends all active sessions on WS connect.
+                # Forward to frontend; enabled state arrives separately via strategy_update.
                 strategies = data.get("strategies", [])
-                existing_store = strategy_store.get(account_number, {})
-                for s in strategies:
-                    sid = int(s.get("sid", -1))
-                    if 0 <= sid <= 4 and sid not in existing_store:
-                        _strategy_store_save(account_number, sid, {
-                            "prompt":  s.get("prompt", ""),
-                            "lot":     s.get("lot",    0.1),
-                            "sl":      s.get("sl",     50),
-                            "tp":      s.get("tp",     100),
-                            "tf":      s.get("tf",     0),
-                            "action":  s.get("action", "BUY"),
-                            "symbol":  s.get("symbol", ""),
-                            "enabled": True,
-                        })
                 logger.info(f"WS-EA strategy_hello: {len(strategies)} sessions for {account_number}")
-
-                # Push any stored parameter changes back to EA (lot/sl/tp/tf only —
-                # indicators stay as set by Bridge_Init; don't send prompt/symbol here)
-                ea_by_sid = {int(s.get("sid", -1)): s for s in strategies if 0 <= int(s.get("sid", -1)) <= 4}
-                current_store = strategy_store.get(account_number, {})
-                for sid, stored in current_store.items():
-                    ea = ea_by_sid.get(sid, {})
-                    upd: dict = {"event": "strategy_update", "sid": sid}
-                    for k in ("lot", "sl", "tp", "tf"):
-                        stored_v = stored.get(k)
-                        ea_v     = ea.get(k)
-                        if stored_v is not None and stored_v != ea_v:
-                            upd[k] = stored_v
-                    # Always sync enabled (EA resets to true on reconnect)
-                    stored_enabled = stored.get("enabled", True)
-                    upd["enabled"] = 1 if stored_enabled else 0
-                    await ws_ea_push(account_number, upd)
-                    logger.info(f"WS-EA re-sync S{sid+1}: {upd}")
-
-                # Forward live strategy list to frontend if connected
                 await ws_chat_push(account_number, {
                     "event":      "strategy_list",
-                    "strategies": [{"sid": sid, **d}
-                                   for sid, d in strategy_store.get(account_number, {}).items()],
+                    "strategies": strategies,
                 })
+
+            elif event == "strategy_list_response":
+                fut = _strategy_list_pending.get(account_number)
+                if fut and not fut.done():
+                    fut.set_result(data)
 
             elif event == "strategy_update":
                 sid = int(data.get("sid", -1))
                 if 0 <= sid <= 4:
-                    existing = strategy_store.get(account_number, {}).get(sid, {})
-                    updated  = {**existing, **{
-                        k: data[k] for k in ("prompt","lot","sl","tp","tf","action","symbol")
-                        if k in data
-                    }}
-                    _strategy_store_save(account_number, sid, updated)
-                    await ws_chat_push(account_number, {"event": "strategy_update", "sid": sid, **updated})
+                    fwd = {"event": "strategy_update", "sid": sid}
+                    for k in ("prompt","lot","sl","tp","tf","action","symbol","enabled"):
+                        if k in data:
+                            fwd[k] = data[k]
+                    await ws_chat_push(account_number, fwd)
 
             elif event == "strategy_delete":
                 sid = int(data.get("sid", -1))
                 if 0 <= sid <= 4:
-                    _strategy_store_delete(account_number, sid)
                     await ws_chat_push(account_number, {"event": "strategy_delete", "sid": sid})
 
             elif event == "signal_order_fail":
@@ -1952,10 +1987,12 @@ async def ws_ea_connect(
 
     except WebSocketDisconnect:
         ws_ea_clients.pop(account_number, None)
-        # Cancel pending EA request so callers don't wait for the full timeout
         fut = _ea_pending.pop(account_number, None)
         if fut and not fut.done():
             fut.cancel()
+        fut2 = _strategy_list_pending.pop(account_number, None)
+        if fut2 and not fut2.done():
+            fut2.cancel()
         logger.info(f"WS-EA disconnected: {account_number}")
 
 
@@ -1984,7 +2021,7 @@ async def _handle_chat_ws(message: str, user: "User") -> str:
                     {"type": "text", "text": STRATEGY_SYSTEM_PROMPT,
                      "cache_control": {"type": "ephemeral"}},
                     {"type": "text", "text": "\n\n## CURRENT EA STRATEGIES\n"
-                                             + _strategy_context(user.account_number)},
+                                             + await _strategy_context(user.account_number)},
                 ],
                 messages=messages,
             ),
@@ -2078,10 +2115,11 @@ async def _handle_chat_ws(message: str, user: "User") -> str:
     if action:
         op  = action.get("op", "")
         sid = int(action.get("sid", 0))
-        ea_connected = user.account_number in ws_ea_clients
-        crud_result  = "no_op"
-        crud_error   = ""
-        acct         = user.account_number
+        ea_connected    = user.account_number in ws_ea_clients
+        crud_result     = "no_op"
+        crud_error      = ""
+        crud_new_values: dict = {}
+        acct            = user.account_number
 
         try:
             if op == "add":
@@ -2106,6 +2144,7 @@ async def _handle_chat_ws(message: str, user: "User") -> str:
                         resolved_lot = config.get("lot",       lot)
                         resolved_sl  = config.get("sl_pip",    sl)
                         resolved_tp  = config.get("tp_pip",    tp)
+                        new_enabled  = bool(action.get("enabled", True))
                         payload: dict = {
                             "event": "strategy_add",
                             "sid":   sid,
@@ -2116,30 +2155,31 @@ async def _handle_chat_ws(message: str, user: "User") -> str:
                                 "sl":         resolved_sl,
                                 "tp_pip":     resolved_tp,
                                 "tp":         resolved_tp,
-                                "tf":         config.get("tf",        tf),
+                                "tf":         config.get("tf") or tf,
                                 "action":     config.get("action",    "BUY"),
                                 "symbol":     config.get("symbol",    ""),
                                 "ohlc_bars":  config.get("ohlc_bars", 3),
                                 "indicators":      config.get("indicators",      []),
                                 "condition":       config.get("condition",       {}),
                                 "exit_condition":  config.get("exit_condition",  {}),
+                                "enabled":    1 if new_enabled else 0,
                             }
                         }
-                        _strategy_store_save(acct, sid, {
+                        crud_new_values = {
                             "prompt":  prompt_str,
                             "lot":     resolved_lot,
                             "sl":      resolved_sl,
                             "tp":      resolved_tp,
-                            "tf":      config.get("tf",     tf),
+                            "tf":      config.get("tf") or tf,
                             "action":  config.get("action", "BUY"),
                             "symbol":  config.get("symbol", ""),
-                            "enabled": True,
-                        })
+                            "enabled": new_enabled,
+                        }
                         await ws_ea_push(acct, payload)
                         crud_result = "sent" if ea_connected else "no_ea"
 
             elif op == "update":
-                existing = strategy_store.get(acct, {}).get(sid, {})
+                existing = (await _fetch_strategy_list(acct)).get(sid, {})
                 if "prompt" in action:
                     # Prompt changed → re-parse condition tree
                     new_prompt = action["prompt"]
@@ -2175,7 +2215,7 @@ async def _handle_chat_ws(message: str, user: "User") -> str:
                                     "sl":         resolved_sl,
                                     "tp_pip":     resolved_tp,
                                     "tp":         resolved_tp,
-                                    "tf":         config.get("tf",        new_tf),
+                                    "tf":         config.get("tf") or new_tf,
                                     "action":     config.get("action",    "BUY"),
                                     "symbol":     config.get("symbol",    new_sym),
                                     "ohlc_bars":  config.get("ohlc_bars", 3),
@@ -2184,36 +2224,34 @@ async def _handle_chat_ws(message: str, user: "User") -> str:
                                     "exit_condition":  config.get("exit_condition",  {}),
                                 }
                             }
-                            _strategy_store_save(acct, sid, {
+                            crud_new_values = {
                                 "prompt":  new_prompt,
                                 "lot":     resolved_lot,
                                 "sl":      resolved_sl,
                                 "tp":      resolved_tp,
-                                "tf":      config.get("tf",     new_tf),
+                                "tf":      config.get("tf") or new_tf,
                                 "action":  config.get("action", "BUY"),
                                 "symbol":  config.get("symbol", new_sym),
                                 "enabled": existing.get("enabled", True),
-                            })
+                            }
                             await ws_ea_push(acct, payload)
                             crud_result = "sent" if ea_connected else "no_ea"
                 else:
                     # Parameters only (lot/sl/tp/tf/enabled) → partial update
                     upd: dict = {"event": "strategy_update", "sid": sid}
-                    store_upd: dict = {}
+                    crud_new_values = dict(existing)
                     for k in ("lot", "sl", "tp", "tf"):
                         if k in action:
                             upd[k] = action[k]
-                            store_upd[k] = action[k]
+                            crud_new_values[k] = action[k]
                     if "enabled" in action:
                         en = bool(action["enabled"])
                         upd["enabled"] = 1 if en else 0
-                        store_upd["enabled"] = en
-                    _strategy_store_save(acct, sid, {**existing, **store_upd})
+                        crud_new_values["enabled"] = en
                     await ws_ea_push(acct, upd)
                     crud_result = "sent" if ea_connected else "no_ea"
 
             elif op == "delete":
-                _strategy_store_delete(acct, sid)
                 await ws_ea_push(acct, {"event": "strategy_delete", "sid": sid})
                 crud_result = "sent" if ea_connected else "no_ea"
 
@@ -2241,7 +2279,7 @@ async def _handle_chat_ws(message: str, user: "User") -> str:
             )
         elif crud_result in ("no_ea", "sent"):
             reply += _format_strategy_summary(
-                user.account_number, sid, op, ea_connected=(crud_result == "sent"),
+                crud_new_values, sid, op, ea_connected=(crud_result == "sent"),
                 old_values=existing if op == "update" else None,
             )
 
@@ -2275,8 +2313,8 @@ async def ws_chat_connect(
     _last_activity[account_number] = time.time()
     logger.info(f"WS-Chat connected: {account_number}")
 
-    # Immediately push current strategy state
-    ss = strategy_store.get(account_number, {})
+    # Immediately push current strategy state (live from EA)
+    ss = await _fetch_strategy_list(account_number)
     await ws.send_json({
         "event":      "strategy_list",
         "strategies": [{"sid": sid, **d} for sid, d in ss.items()],
@@ -2300,6 +2338,11 @@ async def ws_chat_connect(
 
             if event == "ping":
                 await ws.send_json({"event": "pong"})
+
+            elif event == "clear_history":
+                _conv_store.pop(user.account_number, None)
+                logger.info(f"WS-Chat history cleared: {user.account_number}")
+                await ws.send_json({"event": "history_cleared"})
 
             elif event == "chat_message":
                 message = str(data.get("message", "")).strip()
