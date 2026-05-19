@@ -153,8 +153,8 @@ static void LogReset() { g_last_debug.clear(); }
 // §4b  Backend HTTP POST (to license server)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-#define BACKEND_HOST "192.168.21.1"
-#define BACKEND_PORT 8000
+#define BACKEND_HOST "ai-tra-bridge-backend-production.up.railway.app"
+#define BACKEND_PORT 443
 
 // Persistent session + connection handles (reused across calls — 30s timeouts)
 static HINTERNET  g_http_hS  = nullptr;
@@ -195,7 +195,7 @@ static std::string BackendPost(const std::string& path, const std::string& body)
         std::wstring wpath(path.begin(), path.end());
         HINTERNET hR = WinHttpOpenRequest(g_http_hC, L"POST", wpath.c_str(), nullptr,
                                           WINHTTP_NO_REFERER,
-                                          WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+                                          WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
         if (!hR) {
             // Connection handle stale — invalidate and retry once
             WinHttpCloseHandle(g_http_hC); g_http_hC = nullptr;
@@ -1277,7 +1277,7 @@ static bool WsDoConnect() {
     std::wstring wpath(path_s.begin(), path_s.end());
     HINTERNET hReq = WinHttpOpenRequest(g_ws_hC, L"GET", wpath.c_str(), nullptr,
                                         WINHTTP_NO_REFERER,
-                                        WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+                                        WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
     if (!hReq) {
         WinHttpCloseHandle(g_ws_hC); g_ws_hC = nullptr;
         WinHttpCloseHandle(g_ws_hS); g_ws_hS = nullptr;

@@ -84,7 +84,7 @@ extern int             S5_Default_TP  = 100;
 #define BUF_SIZE       65536
 #define OBJ_PREFIX     "AIB_"
 #define BRIDGE_VERSION "3.0.0"
-#define FRONTEND_URL   "http://192.168.21.1:3000"
+#define FRONTEND_URL   "http://aitraiding.up.railway.app"
 
 //── Structs ───────────────────────────────────────────────────────────
 struct IndConfig {
@@ -343,7 +343,7 @@ int OnInit()
          string detail = (StringLen(ws_msg) > 0) ? ws_msg : ws_res;
          LOG("[AI Bridge] WebSocket FAILED (rc=", ws_rc, "): ", detail);
          LOG("[AI Bridge]   → Strategy updates from chat will NOT work.");
-         LOG("[AI Bridge]   → Check: backend running? host=192.168.21.1:8000 reachable?");
+         LOG("[AI Bridge]   → Check: backend running? host=ai-tra-bridge-backend-production.up.railway.app reachable?");
          Alert("[AI Bridge] WebSocket connection failed:\n" + detail +
                "\n\nStrategy chat updates will not reach the EA.\n"
                "Check bridge.log: %APPDATA%\\AI_Bridge\\bridge.log");
