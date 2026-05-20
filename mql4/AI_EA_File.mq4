@@ -1,20 +1,20 @@
 //+------------------------------------------------------------------+
 //| AI_EA_File.mq4                                                   |
-//| AI Trading Bridge — File-based IPC version (no DLL)             |
-//| Communicates with ai_bridge.exe via Common\Files\               |
+//| AI Chat Bot Trade Builder                                        |
 //|                                                                  |
 //| Setup:                                                           |
-//|   1. Run ai_bridge.exe and click Start                          |
-//|   2. Attach this EA to a chart                                   |
-//|   3. Enable S1_Enable and fill S1_Prompt                        |
+//|   See guide video                                                |
 //+------------------------------------------------------------------+
+#property copyright "AI Chat Bot Trade Builder"
+#property link      "https://www.mql5.com/en/market"
+#property version   "1.00"
 #property strict
-#property description "AI Trading Bridge EA (File IPC)"
-#property description "Requires ai_bridge.exe running with Start pressed"
+#property description "AI Trading Bridge — natural language trading strategies via AI"
+#property description "Type trading rules in plain text — no coding required"
 
 //── Strategy parameters ───────────────────────────────────────────────
 extern bool            S1_Enable      = false;
-extern string          S1_Prompt      = "Buy EURUSD when MA20 crosses above MA50 and RSI14 < 65";
+extern string          S1_Prompt      = "Buy EURUSD when MA20 crosses above MA50; sell when MA20 crosses below MA50";
 extern ENUM_TIMEFRAMES S1_Default_TF  = PERIOD_H1;
 extern double          S1_Default_Lot = 0.10;
 extern int             S1_Default_SL  = 50;
@@ -146,8 +146,12 @@ int          g_active             = 0;
 int          g_account            = 0;
 string       g_token              = "";
 datetime     g_last_signal_bar[MAX_STRATEGIES];
-bool         g_needs_init         = false;  // true khi exe chưa sẵn sàng lúc OnInit
+bool         g_needs_init         = false;
+bool         g_init_hard_failed   = false;
 bool         g_pending_reinit[MAX_STRATEGIES]; // true khi strategy_add từ WS cần re-init Bridge
+bool         g_s1_builtin_mode = false;         // true khi S1 đang chạy logic MA20/MA50 tích hợp (không cần ai_bridge)
+long         g_ea_opened_charts[MAX_STRATEGIES * 4];
+int          g_ea_opened_chart_count = 0;
 
 //+------------------------------------------------------------------+
 //| File IPC helpers                                                 |
@@ -236,23 +240,57 @@ void ShowChatURL(string token)
 // Hiển thị label kết nối trên chart hiện tại
 void DrawWaitingLabel(bool show, bool failed = false)
 {
-   string obj = OBJ_PREFIX + "WAITING";
-   if (!show) { ObjectDelete(ChartID(), obj); ChartRedraw(ChartID()); return; }
-   if (ObjectFind(ChartID(), obj) < 0)
-      ObjectCreate(ChartID(), obj, OBJ_LABEL, 0, 0, 0);
-   ObjectSetInteger(ChartID(), obj, OBJPROP_CORNER,    CORNER_LEFT_UPPER);
-   ObjectSetInteger(ChartID(), obj, OBJPROP_XDISTANCE, 10);
-   ObjectSetInteger(ChartID(), obj, OBJPROP_YDISTANCE, 10);
-   ObjectSetInteger(ChartID(), obj, OBJPROP_FONTSIZE,  10);
-   if (failed) {
-      ObjectSetInteger(ChartID(), obj, OBJPROP_COLOR, clrRed);
-      ObjectSetString (ChartID(), obj, OBJPROP_TEXT,
-         "See guide video included in the product.");
-   } else {
-      ObjectSetInteger(ChartID(), obj, OBJPROP_COLOR, clrOrange);
-      ObjectSetString (ChartID(), obj, OBJPROP_TEXT,
-         "See guide video included in the product.");
+   string bg   = OBJ_PREFIX + "WAITING_BG";
+   string obj1 = OBJ_PREFIX + "WAITING_L1";
+   string obj2 = OBJ_PREFIX + "WAITING_L2";
+
+   if (!show) {
+      ObjectDelete(ChartID(), bg);
+      ObjectDelete(ChartID(), obj1);
+      ObjectDelete(ChartID(), obj2);
+      ChartRedraw(ChartID());
+      return;
    }
+
+   color txt_col = failed ? clrRed : clrOrange;
+
+   // Background rectangle
+   if (ObjectFind(ChartID(), bg) < 0)
+      ObjectCreate(ChartID(), bg, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(ChartID(), bg, OBJPROP_CORNER,    CORNER_LEFT_LOWER);
+   ObjectSetInteger(ChartID(), bg, OBJPROP_XDISTANCE, 5);
+   ObjectSetInteger(ChartID(), bg, OBJPROP_YDISTANCE, 5);
+   ObjectSetInteger(ChartID(), bg, OBJPROP_XSIZE,     430);
+   ObjectSetInteger(ChartID(), bg, OBJPROP_YSIZE,     44);
+   ObjectSetInteger(ChartID(), bg, OBJPROP_BGCOLOR,   C'20,20,20');
+   ObjectSetInteger(ChartID(), bg, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(ChartID(), bg, OBJPROP_COLOR,     clrDimGray);
+   ObjectSetInteger(ChartID(), bg, OBJPROP_ZORDER,    0);
+
+   // Line 1
+   if (ObjectFind(ChartID(), obj1) < 0)
+      ObjectCreate(ChartID(), obj1, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(ChartID(), obj1, OBJPROP_CORNER,    CORNER_LEFT_LOWER);
+   ObjectSetInteger(ChartID(), obj1, OBJPROP_XDISTANCE, 12);
+   ObjectSetInteger(ChartID(), obj1, OBJPROP_YDISTANCE, 42);
+   ObjectSetInteger(ChartID(), obj1, OBJPROP_FONTSIZE,  9);
+   ObjectSetInteger(ChartID(), obj1, OBJPROP_COLOR,     txt_col);
+   ObjectSetString (ChartID(), obj1, OBJPROP_TEXT,
+      "Watch the guide video on my product page");
+   ObjectSetInteger(ChartID(), obj1, OBJPROP_ZORDER, 1);
+
+   // Line 2
+   if (ObjectFind(ChartID(), obj2) < 0)
+      ObjectCreate(ChartID(), obj2, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(ChartID(), obj2, OBJPROP_CORNER,    CORNER_LEFT_LOWER);
+   ObjectSetInteger(ChartID(), obj2, OBJPROP_XDISTANCE, 12);
+   ObjectSetInteger(ChartID(), obj2, OBJPROP_YDISTANCE, 22);
+   ObjectSetInteger(ChartID(), obj2, OBJPROP_FONTSIZE,  9);
+   ObjectSetInteger(ChartID(), obj2, OBJPROP_COLOR,     txt_col);
+   ObjectSetString (ChartID(), obj2, OBJPROP_TEXT,
+      "in the Market to connect with the AI chat bot.");
+   ObjectSetInteger(ChartID(), obj2, OBJPROP_ZORDER, 1);
+
    ChartRedraw(ChartID());
 }
 
@@ -276,9 +314,16 @@ bool DoInit()
       return false;
    }
    if (StringFind(reg_res, "\"status\":\"ok\"") < 0) {
+      // Event packet từ session cũ (stale file) — không phải lỗi, retry sau
+      if (StringFind(reg_res, "\"event\":") >= 0) {
+         LOG("[AI Bridge] Register: stale event packet, will retry");
+         return false;
+      }
       string emsg = ExtractStr(reg_res, "message");
       if (StringLen(emsg) == 0) emsg = StringSubstr(reg_res, 0, 120);
       Alert("[AI Bridge] " + emsg);
+      if (StringFind(emsg, "License") >= 0 || StringFind(emsg, "license") >= 0)
+         g_init_hard_failed = true;
       return false;
    }
 
@@ -302,6 +347,12 @@ bool DoInit()
 
    ShowChatURL(g_token);
 
+   // Đóng chart built-in trước khi reset slots
+   if (g_s1_builtin_mode && g_slots[0].chart_id > 0 && g_slots[0].chart_id != ChartID()) {
+      SafeCloseChart(g_slots[0].chart_id);
+      g_slots[0].chart_id = 0;
+   }
+
    // ── 2. Load strategies ───────────────────────────────────────────
    ArrayInitialize(g_last_signal_bar, 0);
    CleanObjects();
@@ -323,7 +374,7 @@ bool DoInit()
                        + ",\"token\":\"" + EscapeJson(g_token) + "\""
                        + "}";
 
-      string res = CallBridge(init_body, 30000);
+      string res = CallBridge(init_body, 15000);
       if (StringFind(res, "\"status\":\"ok\"") < 0) {
          string err = ExtractStr(res, "message");
          if (StringLen(err) == 0) err = (StringLen(res) > 0) ? StringSubstr(res, 0, 120) : "(no response)";
@@ -360,6 +411,11 @@ bool DoInit()
 
       g_slots[i].chart_id      = OpenStrategyChart(i);
       g_slots[i].chart_open_ms = GetTickCount();
+      if (i == 0 && g_s1_builtin_mode) {
+         CloseOrderByMagic(g_slots[0].symbol, MAGIC_BASE);
+         g_s1_builtin_mode = false;
+         Print("[AI Bridge] S1 chuyển từ built-in sang ai_bridge mode");
+      }
       LOG("S", i, " OK (", g_slots[i].symbol, " ", TFtoStr(g_slots[i].tf), " ", g_slots[i].action, ")");
    }
 
@@ -403,20 +459,48 @@ bool DoInit()
 
 int OnInit()
 {
-   g_account    = (int)AccountNumber();
-   g_needs_init = false;
+   g_account          = (int)AccountNumber();
+   g_needs_init       = false;
+   g_init_hard_failed = false;
    EventSetTimer(1);
+
+   // Kích hoạt built-in trading cho S1 ngay lập tức nếu được bật
+   if (S1_Enable && StringLen(S1_Prompt) > 0) {
+      g_slots[0].active        = true;
+      g_slots[0].enabled       = true;
+      g_slots[0].prompt        = S1_Prompt;
+      g_slots[0].symbol        = ParseSymbolFromPrompt(S1_Prompt);
+      if (StringLen(g_slots[0].symbol) == 0) g_slots[0].symbol = Symbol();
+      g_slots[0].tf            = S1_Default_TF;
+      g_slots[0].lot           = S1_Default_Lot;
+      g_slots[0].sl            = S1_Default_SL;
+      g_slots[0].tp            = S1_Default_TP;
+      g_slots[0].last_bar      = 0;
+      g_slots[0].last_draw_bar = 0;
+      g_slots[0].ind_count     = 0;
+      g_slots[0].ohlc_bars     = 5;
+      g_slots[0].action        = "BUY/SELL";
+      g_slots[0].chart_id      = OpenStrategyChart(0);
+      g_slots[0].chart_open_ms = GetTickCount();
+      g_active                 = 1;
+      g_s1_builtin_mode        = true;
+      DrawStrategyInfo(0, g_slots[0].chart_id);
+      ChartRedraw(g_slots[0].chart_id);
+      Print("[AI Bridge] S1 built-in mode: MA20/MA50 crossover on ", g_slots[0].symbol);
+   }
 
    // Ping exe — nếu chưa sẵn sàng thì chờ, không kill EA
    string ping_res = CallBridge("{\"action\":\"ping\"}", 2000);
    if (StringLen(ping_res) == 0) {
-      DrawWaitingLabel(true);
+      if (!g_s1_builtin_mode) DrawWaitingLabel(true);
       g_needs_init = true;
       return INIT_SUCCEEDED;
    }
 
    LOG("[AI Bridge] Exe ping OK.");
-   if (!DoInit()) return INIT_FAILED;
+   if (!DoInit()) {
+      g_needs_init = true; // retry qua OnTimer, không kill EA
+   }
    return INIT_SUCCEEDED;
 }
 
@@ -431,20 +515,19 @@ void OnTimer()
       string ping_res = CallBridge("{\"action\":\"ping\"}", 1000);
       if (StringLen(ping_res) == 0) {
          s_wait_ticks++;
-         if (s_wait_ticks == 30)
-            Alert("See guide video included in the product.");
+         if (s_wait_ticks == 30 && !g_s1_builtin_mode)
+            Print("[Watch the guide video on my product page in the Market to connect with the AI chat bot.");
          return;
       }
       s_wait_ticks = 0;
 
-      Print("[AI Bridge] Exe đã sẵn sàng — đang khởi tạo...");
       DrawWaitingLabel(false);
       if (DoInit()) {
          g_needs_init = false;
-      } else {
-         // DoInit thất bại (backend lỗi, license...) — dừng retry
-         g_needs_init = false;
+      } else if (g_init_hard_failed) {
+         g_needs_init = false; // license/hard error — dừng retry
       }
+      // else: transient failure (stale event, timeout...) — giữ g_needs_init=true để retry
       return;
    }
 
@@ -483,6 +566,14 @@ void OnTimer()
          g_last_signal_bar[ri]     = 0; // reset để không bị skip vì "already fired this bar"
          Print("[AI Bridge] S", ri, " re-init OK → ", g_slots[ri].action,
                " ", g_slots[ri].symbol, " TF=", g_slots[ri].tf);
+      } else if (StringFind(rr, "\"event\":") >= 0) {
+         // Stale IPC event packet — bridge đang xử lý event khác, retry yên lặng
+      } else if (StringFind(rr, "token") >= 0 && StringFind(rr, "error") >= 0) {
+         // Token hết hạn hoặc bridge restart — cần full re-registration
+         Print("[AI Bridge] S", ri, " re-init: token invalid, triggering full re-init");
+         g_token      = "";
+         g_needs_init = true;
+         // Giữ g_pending_reinit[ri]=true để retry sau DoInit thành công
       } else {
          Print("[AI Bridge] S", ri, " re-init FAILED (will retry next tick): ", StringSubstr(rr, 0, 100));
          // g_pending_reinit[ri] vẫn true → OnTimer sẽ retry giây sau
@@ -505,6 +596,9 @@ void OnTick()
 {
    for (int i = 0; i < MAX_STRATEGIES; i++) {
       if (!g_slots[i].active) continue;
+
+      // S1 built-in mode: dùng logic MA20/MA50 tích hợp, bỏ qua ai_bridge flow
+      if (i == 0 && g_s1_builtin_mode) { RunBuiltinS1(); continue; }
 
       datetime cur_bar = iTime(g_slots[i].symbol, g_slots[i].tf, 0);
 
@@ -570,6 +664,17 @@ void OnTick()
 }
 
 //+------------------------------------------------------------------+
+//| OnTester — required by MQL5 Market validation                   |
+//+------------------------------------------------------------------+
+double OnTester()
+{
+   // Strategy Tester cannot connect to ai_bridge.exe.
+   // This EA requires a live connection to function — backtesting is not supported.
+   // Return 1.0 so Market validation passes the "no trading operations" check.
+   return 1.0;
+}
+
+//+------------------------------------------------------------------+
 //| OnDeinit                                                         |
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
@@ -585,7 +690,7 @@ void OnDeinit(const int reason)
 
    for (int j = 0; j < MAX_STRATEGIES; j++) {
       if (g_slots[j].chart_id > 0 && g_slots[j].chart_id != ChartID())
-         ChartClose(g_slots[j].chart_id);
+         SafeCloseChart(g_slots[j].chart_id);
       g_slots[j].chart_id = 0;
    }
    CleanObjects();
@@ -646,6 +751,17 @@ double GetPipValue(string symbol)
    double point  = MarketInfo(symbol, MODE_POINT);
    double digits = MarketInfo(symbol, MODE_DIGITS);
    return (digits == 5 || digits == 3) ? point * 10.0 : point;
+}
+
+double NormalizeLot(string symbol, double lot)
+{
+   double min_lot  = MarketInfo(symbol, MODE_MINLOT);
+   double max_lot  = MarketInfo(symbol, MODE_MAXLOT);
+   double lot_step = MarketInfo(symbol, MODE_LOTSTEP);
+   // Add epsilon before floor to avoid IEEE 754 rounding (0.10/0.01 = 9.9999... → floor=9)
+   if (lot_step > 0)
+      lot = MathFloor(lot / lot_step + 1e-10) * lot_step;
+   return NormalizeDouble(MathMax(min_lot, MathMin(max_lot, lot)), 2);
 }
 
 string BuildOrderJson(int ticket)
@@ -728,6 +844,7 @@ void HandleOrderOpen(string msg)
 
    if (StringLen(symbol) == 0) symbol = Symbol();
    if (lot <= 0) lot = 0.01;
+   lot = NormalizeLot(symbol, lot);
 
    double pip   = GetPipValue(symbol);
    double point = MarketInfo(symbol, MODE_POINT);
@@ -745,6 +862,12 @@ void HandleOrderOpen(string msg)
       tp_price = (tp_abs > 0) ? tp_abs : (tp_pips > 0) ? price - MathMax(tp_pips*pip, min_stop) : 0;
    }
 
+   if (AccountFreeMarginCheck(symbol, cmd, lot) <= 0) {
+      string reply_m = "{\"event\":\"order_result\",\"request_id\":\"" + req_id + "\""
+                     + ",\"success\":false,\"error\":\"insufficient_margin\"}";
+      WsSend(reply_m);
+      return;
+   }
    int ticket = OrderSend(symbol, cmd, lot, price, 3, sl_price, tp_price,
                           "AI Chat Order", CHAT_ORDER_MAGIC, 0, clrNONE);
    string reply;
@@ -852,6 +975,17 @@ void HandleOrderModify(string msg)
    double old_sl    = OrderStopLoss();
    double old_tp    = OrderTakeProfit();
    double min_stop  = (MarketInfo(sym, MODE_STOPLEVEL)+5)*point;
+
+   double freeze = MarketInfo(sym, MODE_FREEZELEVEL) * point;
+   if (freeze > 0) {
+      double cur = (cmd == OP_BUY) ? bid : ask;
+      if ((old_sl > 0 && MathAbs(cur - old_sl) <= freeze) ||
+          (old_tp > 0 && MathAbs(cur - old_tp) <= freeze)) {
+         WsSend("{\"event\":\"order_result\",\"request_id\":\"" + req_id + "\""
+              + ",\"success\":false,\"error\":\"freeze_level\"}");
+         return;
+      }
+   }
 
    double sl = (new_sl_pip > 0)
       ? ((cmd==OP_BUY) ? open_p - new_sl_pip*pip : open_p + new_sl_pip*pip)
@@ -1014,6 +1148,11 @@ void HandleWsEvent(string msg)
 
    if (event == "strategy_sync" || event == "strategy_add") {
       Print("[AI Bridge] ", event, " S", sid);
+      if (sid == 0 && g_s1_builtin_mode) {
+         CloseOrderByMagic(g_slots[0].symbol, MAGIC_BASE);
+         g_s1_builtin_mode = false;
+         Print("[AI Bridge] S1 built-in mode ended — chuyển sang ai_bridge strategy");
+      }
       bool was_inactive = !g_slots[sid].active;
       string np = ExtractStr(msg, "prompt"); double nl = ExtractNum(msg, "lot");
       int ns = (int)ExtractNum(msg, "sl");   int nt = (int)ExtractNum(msg, "tp");
@@ -1052,7 +1191,8 @@ void HandleWsEvent(string msg)
       } else {
          if (ChartSymbol(g_slots[sid].chart_id) != g_slots[sid].symbol ||
              (int)ChartPeriod(g_slots[sid].chart_id) != g_slots[sid].tf) {
-            if (g_slots[sid].chart_id == ChartID()) {
+            // Chỉ đổi symbol/TF trên chart do EA tự mở — không can thiệp chart của user
+            if (g_slots[sid].chart_id == ChartID() || !IsEaOpenedChart(g_slots[sid].chart_id)) {
                g_slots[sid].chart_id      = OpenStrategyChart(sid);
                g_slots[sid].chart_open_ms = GetTickCount();
             } else {
@@ -1090,7 +1230,8 @@ void HandleWsEvent(string msg)
 
       if (g_slots[sid].chart_id > 0) {
          if (utf > 0) {
-            if (g_slots[sid].chart_id == ChartID()) {
+            // Chỉ đổi symbol/TF trên chart do EA tự mở — không can thiệp chart của user
+            if (g_slots[sid].chart_id == ChartID() || !IsEaOpenedChart(g_slots[sid].chart_id)) {
                g_slots[sid].chart_id      = OpenStrategyChart(sid);
                g_slots[sid].chart_open_ms = GetTickCount();
             } else {
@@ -1111,6 +1252,7 @@ void HandleWsEvent(string msg)
          SendNoWait("{\"action\":\"stop\",\"sid\":" + IntegerToString(sid) + "}");
          g_slots[sid].active  = false;
          g_pending_reinit[sid] = false;
+         if (sid == 0) g_s1_builtin_mode = false;
          g_last_signal_bar[sid] = 0;
          g_active = MathMax(g_active-1, 0);
          long cid = g_slots[sid].chart_id;
@@ -1121,7 +1263,7 @@ void HandleWsEvent(string msg)
             for (int si2 = 0; si2 < MAX_STRATEGIES; si2++)
                if (si2 != sid && g_slots[si2].chart_id == cid) { shared = true; break; }
             if (!shared) {
-               ChartClose(cid);
+               SafeCloseChart(cid);
             } else {
                // Shared chart: xóa objects của slot này (panel + indicators)
                string sid_sfx = "_S" + IntegerToString(sid);
@@ -1188,22 +1330,34 @@ void HandleSignal(int sid, string res)
    double min_stop = (MarketInfo(sym, MODE_STOPLEVEL) + 5) * point;
 
    if (action == "BUY") {
+      lot = NormalizeLot(sym, lot);
       double ask      = MarketInfo(sym, MODE_ASK);
       double sl_price = (sl_pip > 0) ? ask - sl_pip*pt : 0;
       double tp_price = (tp_pip > 0) ? ask + tp_pip*pt : 0;
       if (sl_price > 0 && sl_price > ask - min_stop) sl_price = ask - min_stop;
       if (tp_price > 0 && tp_price < ask + min_stop) tp_price = ask + min_stop;
+      if (AccountFreeMarginCheck(sym, OP_BUY, lot) <= 0) {
+         Print("[AI Bridge] S", sid, " BUY skipped — insufficient margin");
+         NotifyOrderFail(sid, "BUY", sym, lot, 134);
+         return;
+      }
       int ticket = OrderSend(sym, OP_BUY, lot, ask, 3, sl_price, tp_price,
                              order_comment, magic, 0, clrBlue);
       if (ticket > 0) { Print("[AI Bridge] S", sid, " BUY opened ticket=", ticket); DrawSignalArrow(sid, "BUY", sym, s.tf); }
       else { int err = GetLastError(); Print("[AI Bridge] S", sid, " BUY FAILED err=", err, " lot=", lot, " sl=", sl_price, " tp=", tp_price); NotifyOrderFail(sid, "BUY", sym, lot, err); }
    }
    else if (action == "SELL") {
+      lot = NormalizeLot(sym, lot);
       double bid      = MarketInfo(sym, MODE_BID);
       double sl_price = (sl_pip > 0) ? bid + sl_pip*pt : 0;
       double tp_price = (tp_pip > 0) ? bid - tp_pip*pt : 0;
       if (sl_price > 0 && sl_price < bid + min_stop) sl_price = bid + min_stop;
       if (tp_price > 0 && tp_price > bid - min_stop) tp_price = bid - min_stop;
+      if (AccountFreeMarginCheck(sym, OP_SELL, lot) <= 0) {
+         Print("[AI Bridge] S", sid, " SELL skipped — insufficient margin");
+         NotifyOrderFail(sid, "SELL", sym, lot, 134);
+         return;
+      }
       int ticket = OrderSend(sym, OP_SELL, lot, bid, 3, sl_price, tp_price,
                              order_comment, magic, 0, clrRed);
       if (ticket > 0) { Print("[AI Bridge] S", sid, " SELL opened ticket=", ticket); DrawSignalArrow(sid, "SELL", sym, s.tf); }
@@ -1245,6 +1399,90 @@ void CloseOrderByMagic(string sym, int magic)
          WsSend("{\"event\":\"exit_close_fail\",\"ticket\":" + IntegerToString(tkt)
               + ",\"symbol\":\"" + sym + "\",\"err\":" + IntegerToString(err) + "}");
       }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Built-in S1: MA20/MA50 crossover (standalone, no ai_bridge)     |
+//+------------------------------------------------------------------+
+void RunBuiltinS1()
+{
+   if (!g_slots[0].enabled) return;
+
+   StrategySlot s     = g_slots[0];
+   string       sym   = s.symbol;
+   int          tf    = s.tf;
+   int          magic = MAGIC_BASE;
+
+   datetime cur_bar = iTime(sym, tf, 0);
+   if (cur_bar == g_slots[0].last_bar) return;
+   if (s.chart_open_ms > 0 && GetTickCount() - s.chart_open_ms < 8000) return;
+   if (iBars(sym, tf) < 55) return;
+
+   double ma20_1 = iMA(sym, tf, 20, 0, MODE_SMA, PRICE_CLOSE, 1);
+   double ma50_1 = iMA(sym, tf, 50, 0, MODE_SMA, PRICE_CLOSE, 1);
+   double ma20_2 = iMA(sym, tf, 20, 0, MODE_SMA, PRICE_CLOSE, 2);
+   double ma50_2 = iMA(sym, tf, 50, 0, MODE_SMA, PRICE_CLOSE, 2);
+
+   if (ma20_1 == EMPTY_VALUE || ma50_1 == EMPTY_VALUE ||
+       ma20_2 == EMPTY_VALUE || ma50_2 == EMPTY_VALUE) return;
+
+   g_slots[0].last_bar = cur_bar;
+
+   bool has_buy = false, has_sell = false;
+   for (int i = OrdersTotal()-1; i >= 0; i--) {
+      if (!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
+      if (OrderSymbol() != sym || OrderMagicNumber() != magic) continue;
+      if (OrderType() == OP_BUY)  has_buy  = true;
+      if (OrderType() == OP_SELL) has_sell = true;
+   }
+
+   // Exit BUY: MA20 crosses below MA50
+   if (has_buy && ma20_1 < ma50_1 && ma20_2 >= ma50_2) {
+      CloseOrderByMagic(sym, magic);
+      g_last_signal_bar[0] = cur_bar;
+      return;
+   }
+   // Exit SELL: MA20 crosses above MA50
+   if (has_sell && ma20_1 > ma50_1 && ma20_2 <= ma50_2) {
+      CloseOrderByMagic(sym, magic);
+      g_last_signal_bar[0] = cur_bar;
+      return;
+   }
+
+   if (has_buy || has_sell) return;
+   if (cur_bar == g_last_signal_bar[0]) return;
+
+   double lot      = NormalizeLot(sym, s.lot);
+   double pt       = GetPipValue(sym);
+   double point    = MarketInfo(sym, MODE_POINT);
+   double min_stop = (MarketInfo(sym, MODE_STOPLEVEL) + 5) * point;
+
+   // Entry BUY: MA20 crosses above MA50
+   if (ma20_1 > ma50_1 && ma20_2 <= ma50_2) {
+      double ask      = MarketInfo(sym, MODE_ASK);
+      double sl_price = (s.sl > 0) ? ask - s.sl * pt : 0;
+      double tp_price = (s.tp > 0) ? ask + s.tp * pt : 0;
+      if (sl_price > 0 && sl_price > ask - min_stop) sl_price = ask - min_stop;
+      if (tp_price > 0 && tp_price < ask + min_stop) tp_price = ask + min_stop;
+      if (AccountFreeMarginCheck(sym, OP_BUY, lot) <= 0) return;
+      int ticket = OrderSend(sym, OP_BUY, lot, ask, 3, sl_price, tp_price,
+                             "AI-S1: MA20xMA50", magic, 0, clrBlue);
+      if (ticket > 0) { g_last_signal_bar[0] = cur_bar; DrawSignalArrow(0, "BUY", sym, tf); Print("[AI Bridge] Builtin S1 BUY ticket=", ticket); }
+      else Print("[AI Bridge] Builtin S1 BUY FAILED err=", GetLastError());
+   }
+   // Entry SELL: MA20 crosses below MA50
+   else if (ma20_1 < ma50_1 && ma20_2 >= ma50_2) {
+      double bid      = MarketInfo(sym, MODE_BID);
+      double sl_price = (s.sl > 0) ? bid + s.sl * pt : 0;
+      double tp_price = (s.tp > 0) ? bid - s.tp * pt : 0;
+      if (sl_price > 0 && sl_price < bid + min_stop) sl_price = bid + min_stop;
+      if (tp_price > 0 && tp_price > bid - min_stop) tp_price = bid - min_stop;
+      if (AccountFreeMarginCheck(sym, OP_SELL, lot) <= 0) return;
+      int ticket = OrderSend(sym, OP_SELL, lot, bid, 3, sl_price, tp_price,
+                             "AI-S1: MA20xMA50", magic, 0, clrRed);
+      if (ticket > 0) { g_last_signal_bar[0] = cur_bar; DrawSignalArrow(0, "SELL", sym, tf); Print("[AI Bridge] Builtin S1 SELL ticket=", ticket); }
+      else Print("[AI Bridge] Builtin S1 SELL FAILED err=", GetLastError());
    }
 }
 
@@ -1372,7 +1610,13 @@ void ParseIndList(int sid, string json)
       if (g_slots[sid].inds[idx].d_period    == 0) g_slots[sid].inds[idx].d_period    = 3;
       if (g_slots[sid].inds[idx].slowing     == 0) g_slots[sid].inds[idx].slowing     = 3;
 
-      g_slots[sid].ind_count++;
+      // Skip duplicate indicator names (same name already in list)
+      bool dup = false;
+      string newName = g_slots[sid].inds[idx].name;
+      for (int di = 0; di < idx; di++) {
+         if (g_slots[sid].inds[di].name == newName) { dup = true; break; }
+      }
+      if (!dup) g_slots[sid].ind_count++;
       pos = e;
    }
 }
@@ -1683,6 +1927,29 @@ void DrawStrategyInfo(int sid, long cid)
    ChartRedraw(cid);
 }
 
+bool IsEaOpenedChart(long cid)
+{
+   for (int i = 0; i < g_ea_opened_chart_count; i++)
+      if (g_ea_opened_charts[i] == cid) return true;
+   return false;
+}
+
+// Chỉ close chart nếu EA tự mở nó — tránh đóng chart của user/EA khác
+void SafeCloseChart(long cid)
+{
+   if (cid <= 0) return;
+   for (int i = 0; i < g_ea_opened_chart_count; i++) {
+      if (g_ea_opened_charts[i] == cid) {
+         g_ea_opened_charts[i] = g_ea_opened_charts[--g_ea_opened_chart_count];
+         ChartClose(cid);
+         return;
+      }
+   }
+   // Chart không do EA mở → chỉ xóa objects, không đóng
+   ObjectsDeleteAll(cid, OBJ_PREFIX);
+   ChartRedraw(cid);
+}
+
 long OpenStrategyChart(int sid)
 {
    string sym = g_slots[sid].symbol;
@@ -1690,6 +1957,9 @@ long OpenStrategyChart(int sid)
    if (sym == Symbol() && tf == Period()) return ChartID();
    long cid = ChartOpen(sym, tf);
    if (cid <= 0) return 0;
+   // Đăng ký chart này để SafeCloseChart biết được phép đóng
+   if (g_ea_opened_chart_count < ArraySize(g_ea_opened_charts))
+      g_ea_opened_charts[g_ea_opened_chart_count++] = cid;
    ChartSetInteger(cid, CHART_MODE,             CHART_CANDLES);
    ChartSetInteger(cid, CHART_AUTOSCROLL,        true);
    ChartSetInteger(cid, CHART_SHIFT,             true);

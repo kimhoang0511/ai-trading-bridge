@@ -85,6 +85,7 @@ static std::string IpcEncrypt(const std::string& data) {
 #define WM_UPDATE_STATUS (WM_USER + 2)
 #define WM_TOKEN_READY   (WM_USER + 3)
 #define WM_QR_READY      (WM_USER + 4)
+#define WM_TRAY_ICON     (WM_USER + 5)
 
 // ── Globals ───────────────────────────────────────────────────────────────────
 static HWND              g_hwnd          = nullptr;
@@ -109,6 +110,9 @@ static HWND              g_hwnd_qr_btn   = nullptr;
 static bool              g_show_log      = false;  // set false để ẩn log area
 static HWND              g_hwnd_qr_dlg   = nullptr;
 static Gdiplus::Image*   g_qr_img        = nullptr;
+static NOTIFYICONDATAA   g_nid           = {};
+static bool              g_tray_added    = false;
+static bool              g_ea_was_connected = false;
 
 static void LoadLogo() {
     HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, g_logo_png_size);
@@ -306,6 +310,15 @@ static void UILog(const std::string& msg) {
 
 static void PostStatusUpdate() {
     if (g_hwnd) PostMessage(g_hwnd, WM_UPDATE_STATUS, 0, 0);
+}
+
+static void ShowTrayNotification(const char* title, const char* msg) {
+    if (!g_tray_added) return;
+    g_nid.uFlags      = NIF_ICON | NIF_TIP | NIF_INFO;
+    g_nid.dwInfoFlags = NIIF_WARNING;
+    strncpy_s(g_nid.szInfoTitle, sizeof(g_nid.szInfoTitle), title, _TRUNCATE);
+    strncpy_s(g_nid.szInfo,      sizeof(g_nid.szInfo),      msg,   _TRUNCATE);
+    Shell_NotifyIconA(NIM_MODIFY, &g_nid);
 }
 
 // ── Request dispatcher ────────────────────────────────────────────────────────
@@ -643,10 +656,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (!g_running) {
             SetWindowTextA(g_hwnd_ea_stat,  "EA: --");
             SetWindowTextA(g_hwnd_srv_stat, "Server: --");
+            g_ea_was_connected = false;
         } else {
             DWORD last = g_last_ea_tick.load();
             bool ea_ok = (last > 0 && GetTickCount() - last < 5000);
             SetWindowTextA(g_hwnd_ea_stat, ea_ok ? "EA: Connected" : "EA: No signal");
+
+            if (g_ea_was_connected && !ea_ok)
+                ShowTrayNotification("AI Bridge | EA Disconnected",
+                    "Connection to MT4 EA lost.\nPlease restart the EA in MetaTrader 4.");
+            g_ea_was_connected = ea_ok;
 
             bool srv_ok = g_srv_connected.load();
             SetWindowTextA(g_hwnd_srv_stat, srv_ok ? "Server: Connected" : "Server: Disconnected");
@@ -750,7 +769,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
     }
 
+    case WM_TRAY_ICON:
+        if (LOWORD(lp) == WM_LBUTTONUP) {
+            ShowWindow(hwnd, SW_RESTORE);
+            SetForegroundWindow(hwnd);
+        }
+        return 0;
+
     case WM_DESTROY:
+        if (g_tray_added) { Shell_NotifyIconA(NIM_DELETE, &g_nid); g_tray_added = false; }
         g_running = false;
         Bridge_WsDisconnect();
         if (g_worker.joinable()) g_worker.detach();
@@ -799,6 +826,16 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nShow) {
 
     ShowWindow(g_hwnd, nShow);
     UpdateWindow(g_hwnd);
+
+    // Add system tray icon (required for balloon notifications)
+    g_nid.cbSize           = sizeof(NOTIFYICONDATAA);
+    g_nid.hWnd             = g_hwnd;
+    g_nid.uID              = 1;
+    g_nid.uFlags           = NIF_ICON | NIF_TIP | NIF_MESSAGE;
+    g_nid.uCallbackMessage = WM_TRAY_ICON;
+    g_nid.hIcon            = g_icon_small ? g_icon_small : LoadIconA(nullptr, IDI_APPLICATION);
+    strncpy_s(g_nid.szTip, sizeof(g_nid.szTip), "AI Chat Bot Trade Builder", _TRUNCATE);
+    g_tray_added = (Shell_NotifyIconA(NIM_ADD, &g_nid) == TRUE);
 
     MSG m = {};
     while (GetMessage(&m, nullptr, 0, 0)) {
