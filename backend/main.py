@@ -244,7 +244,7 @@ def health():
 
 @app.get("/mql4/ai_bridge.zip")
 def download_ai_bridge():
-    path = os.path.join(os.path.dirname(__file__), "..", "mql4", "ai_bridge.zip")
+    path = os.path.join(os.path.dirname(__file__), "ai_bridge.zip")
     path = os.path.abspath(path)
     if not os.path.exists(path):
         from fastapi import HTTPException
