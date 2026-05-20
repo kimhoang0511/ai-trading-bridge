@@ -594,7 +594,7 @@ string BuildValues(int sid)
       return "";
 
    string parts[];
-   int    n = s.ohlc_bars * 5 + s.ind_count + 6;
+   int    n = s.ohlc_bars * 5 + s.ind_count + 7; // +7: ask,bid,point,spread,time,bar_time,has_position
    ArrayResize(parts, n);
    int idx = 0;
 
@@ -606,12 +606,15 @@ string BuildValues(int sid)
       parts[idx++] = "\"close_" +si+"\":"+DoubleToStr(iClose(s.symbol,s.tf,i),5);
       parts[idx++] = "\"volume_"+si+"\":"+DoubleToStr((double)iVolume(s.symbol,s.tf,i),0);
    }
-   parts[idx++] = "\"ask\":"      +DoubleToStr(MarketInfo(s.symbol,MODE_ASK),5);
-   parts[idx++] = "\"bid\":"      +DoubleToStr(MarketInfo(s.symbol,MODE_BID),5);
-   parts[idx++] = "\"point\":"    +DoubleToStr(MarketInfo(s.symbol,MODE_POINT),5);
-   parts[idx++] = "\"spread\":"   +DoubleToStr(MarketInfo(s.symbol,MODE_SPREAD),1);
-   parts[idx++] = "\"time\":"     +IntegerToString((int)TimeCurrent());
-   parts[idx++] = "\"bar_time\":"+IntegerToString((int)iTime(s.symbol,s.tf,0));
+   parts[idx++] = "\"ask\":"         +DoubleToStr(MarketInfo(s.symbol,MODE_ASK),5);
+   parts[idx++] = "\"bid\":"         +DoubleToStr(MarketInfo(s.symbol,MODE_BID),5);
+   parts[idx++] = "\"point\":"       +DoubleToStr(MarketInfo(s.symbol,MODE_POINT),5);
+   parts[idx++] = "\"spread\":"      +DoubleToStr(MarketInfo(s.symbol,MODE_SPREAD),1);
+   parts[idx++] = "\"time\":"        +IntegerToString((int)TimeCurrent());
+   parts[idx++] = "\"bar_time\":"    +IntegerToString((int)iTime(s.symbol,s.tf,0));
+   // has_position: 1 if an open order exists for this slot, 0 otherwise.
+   // Bridge_Check uses this to evaluate only exit (1) or only entry (0).
+   parts[idx++] = "\"has_position\":" +IntegerToString(HasOpenOrder(s.symbol, MAGIC_BASE + sid) ? 1 : 0);
 
    for (int i = 0; i < s.ind_count; i++) {
       double val = CalcIndicator(s.inds[i]);

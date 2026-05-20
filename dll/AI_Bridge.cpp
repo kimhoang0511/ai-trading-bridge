@@ -1151,14 +1151,18 @@ Bridge_Check(int sid, const wchar_t* values_json, int account,
     std::string vals_str = W2S(values_json);
     V vals=ParseValues(vals_str.c_str());
 
-    // Build indicator debug string (non-OHLCV named keys only)
+    // has_position: 1=open order exists, 0=no order, -1=legacy/unknown
+    // MQL4 injects this so Bridge_Check can separate exit-only vs entry-only evaluation.
+    int has_position = (int)vals.get("has_position", -1.0);
+
+    // Build indicator debug string (non-OHLCV, non-meta named keys only)
     auto DebugVals = [&]() -> std::string {
         std::string out;
         for (auto& kv : vals.d) {
             const std::string& k = kv.first;
             if (k.rfind("open_",0)==0 || k.rfind("high_",0)==0 ||
                 k.rfind("low_",0)==0  || k.rfind("close_",0)==0 ||
-                k.rfind("volume_",0)==0) continue;
+                k.rfind("volume_",0)==0 || k == "has_position") continue;
             if (!out.empty()) out += ' ';
             char tmp[64];
             _snprintf_s(tmp, sizeof(tmp), _TRUNCATE, "%s=%.5f", k.c_str(), kv.second);
@@ -1167,25 +1171,34 @@ Bridge_Check(int sid, const wchar_t* values_json, int account,
         return out.empty() ? "(no indicators)" : out;
     };
 
-    // Exit condition evaluated first (higher priority than entry)
-    if (s.exit_condition.get("type")) {
+    // ── Exit condition ────────────────────────────────────────────────────────
+    // Evaluate only when: position is open (has_position=1) OR legacy mode (-1).
+    // Skip when has_position=0 so an always-true exit never blocks entry.
+    if (s.exit_condition.get("type") && has_position != 0) {
         bool should_exit = false;
         try { should_exit = EvalCond(s.exit_condition, vals, &s.seq_exit); }
         catch(const std::exception& e){
             Log(std::string("EvalCond(exit) exception: ")+e.what());
         }
-        Log(std::string("CHECK S")+std::to_string(sid)+" exit_eval="+
-            (should_exit?"true":"false")+" "+DebugVals());
+        Log(std::string("CHECK S")+std::to_string(sid)
+            +" has_pos="+std::to_string(has_position)
+            +" exit_eval="+(should_exit?"true":"false")+" "+DebugVals());
         if (should_exit) {
-            s.seq_exit  = SeqState{};  // reset so SEQ exit doesn't re-fire next bar
-            s.seq_entry = SeqState{};  // reset entry SEQ too — avoid immediate re-entry
+            s.seq_exit  = SeqState{};
+            s.seq_entry = SeqState{};
             FillBuf("{\"action\":\"EXIT\"}",out_buf,buf_size);
             Log("EXIT signal → "+s.symbol);
             return 0;
         }
     }
 
-    // Entry condition
+    // ── Entry condition ───────────────────────────────────────────────────────
+    // Skip when position is already open — MQL4 guards duplicate opens too,
+    // but skipping here avoids unnecessary EvalCond work.
+    if (has_position == 1) {
+        FillBuf("{\"action\":\"NONE\"}",out_buf,buf_size); return 0;
+    }
+
     bool signal=false;
     try { signal=EvalCond(s.condition, vals, &s.seq_entry); }
     catch(const std::exception& e){
@@ -1193,8 +1206,9 @@ Bridge_Check(int sid, const wchar_t* values_json, int account,
         FillBuf("{\"action\":\"NONE\"}",out_buf,buf_size); return 0;
     }
 
-    Log(std::string("CHECK S")+std::to_string(sid)+" entry_eval="+
-        (signal?"true → "+s.action:"false")+" "+DebugVals());
+    Log(std::string("CHECK S")+std::to_string(sid)
+        +" has_pos="+std::to_string(has_position)
+        +" entry_eval="+(signal?"true → "+s.action:"false")+" "+DebugVals());
 
     if(!signal){
         FillBuf("{\"action\":\"NONE\"}",out_buf,buf_size); return 0;
