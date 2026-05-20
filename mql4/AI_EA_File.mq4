@@ -176,7 +176,7 @@ string CallBridge(string json, int timeout_ms=4000)
    }
    if (fh == INVALID_HANDLE) {
       Print("[File] Cannot write ", REQ_FILE, " (err=", GetLastError(),
-            ") — check Common\\Files directory and ai_bridge.exe");
+            ") — check Common");
       return "";
    }
    FileWriteString(fh, IpcEncrypt(json));
@@ -233,8 +233,8 @@ void ShowChatURL(string token)
    Print("[AI Bridge] Chat URL: ", chat_url);
 }
 
-// Hiển thị label "Waiting for ai_bridge.exe..." trên chart hiện tại
-void DrawWaitingLabel(bool show)
+// Hiển thị label kết nối trên chart hiện tại
+void DrawWaitingLabel(bool show, bool failed = false)
 {
    string obj = OBJ_PREFIX + "WAITING";
    if (!show) { ObjectDelete(ChartID(), obj); ChartRedraw(ChartID()); return; }
@@ -243,10 +243,16 @@ void DrawWaitingLabel(bool show)
    ObjectSetInteger(ChartID(), obj, OBJPROP_CORNER,    CORNER_LEFT_UPPER);
    ObjectSetInteger(ChartID(), obj, OBJPROP_XDISTANCE, 10);
    ObjectSetInteger(ChartID(), obj, OBJPROP_YDISTANCE, 10);
-   ObjectSetInteger(ChartID(), obj, OBJPROP_COLOR,     clrOrange);
    ObjectSetInteger(ChartID(), obj, OBJPROP_FONTSIZE,  10);
-   ObjectSetString (ChartID(), obj, OBJPROP_TEXT,
-                    "⏳ AI Bridge: Waiting for ai_bridge.exe...");
+   if (failed) {
+      ObjectSetInteger(ChartID(), obj, OBJPROP_COLOR, clrRed);
+      ObjectSetString (ChartID(), obj, OBJPROP_TEXT,
+         "See guide video included in the product.");
+   } else {
+      ObjectSetInteger(ChartID(), obj, OBJPROP_COLOR, clrOrange);
+      ObjectSetString (ChartID(), obj, OBJPROP_TEXT,
+         "See guide video included in the product.");
+   }
    ChartRedraw(ChartID());
 }
 
@@ -267,7 +273,6 @@ bool DoInit()
    LOG("[AI Bridge] Register: ", StringSubstr(reg_res, 0, 120));
 
    if (StringLen(reg_res) == 0) {
-      Print("[AI Bridge] Backend not reachable. Check ai_bridge.exe logs.");
       return false;
    }
    if (StringFind(reg_res, "\"status\":\"ok\"") < 0) {
@@ -405,7 +410,6 @@ int OnInit()
    // Ping exe — nếu chưa sẵn sàng thì chờ, không kill EA
    string ping_res = CallBridge("{\"action\":\"ping\"}", 2000);
    if (StringLen(ping_res) == 0) {
-      Print("[AI Bridge] ai_bridge.exe chưa sẵn sàng — sẽ tự init khi exe khởi động.");
       DrawWaitingLabel(true);
       g_needs_init = true;
       return INIT_SUCCEEDED;
@@ -423,8 +427,15 @@ void OnTimer()
 {
    // Chờ exe khởi động
    if (g_needs_init) {
+      static int s_wait_ticks = 0;
       string ping_res = CallBridge("{\"action\":\"ping\"}", 1000);
-      if (StringLen(ping_res) == 0) return; // exe chưa ready, thử lại giây sau
+      if (StringLen(ping_res) == 0) {
+         s_wait_ticks++;
+         if (s_wait_ticks == 30)
+            Alert("See guide video included in the product.");
+         return;
+      }
+      s_wait_ticks = 0;
 
       Print("[AI Bridge] Exe đã sẵn sàng — đang khởi tạo...");
       DrawWaitingLabel(false);

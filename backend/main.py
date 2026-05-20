@@ -21,7 +21,7 @@ import anthropic
 import uvicorn
 from fastapi import FastAPI, Depends, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from sqlalchemy.orm import Session
 
 from auth import create_token, decode_token
@@ -240,6 +240,20 @@ def _verify_account(token: str, db) -> "User":
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/mql4/ai_bridge.zip")
+def download_ai_bridge():
+    path = os.path.join(os.path.dirname(__file__), "..", "mql4", "ai_bridge.zip")
+    path = os.path.abspath(path)
+    if not os.path.exists(path):
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(
+        path,
+        media_type="application/zip",
+        filename="ai_bridge.zip",
+    )
 
 
 # ── Register endpoint ─────────────────────────────────────────────────────────
