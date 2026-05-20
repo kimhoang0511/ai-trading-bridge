@@ -731,6 +731,9 @@ def _extract_execute(text: str) -> "dict | None":
     if pos < 0:
         return None
     start = pos + len("[EXECUTE:")
+    # Tolerate optional whitespace between "[EXECUTE:" and "{"
+    while start < len(text) and text[start] in (' ', '\t', '\n'):
+        start += 1
     if start >= len(text) or text[start] != "{":
         return None
     depth, end = 0, start
@@ -1503,7 +1506,8 @@ Do NOT ask for confirmation — this is a reversible toggle, not a destructive a
 Reply with a success message AND a full summary of the strategy, formatted as:
 
   ✅ [Slot] – [Direction] [Symbol] ([Timeframe])
-  • Entry : [entry condition from prompt, in user's language]
+  • Entry : [entry condition, in user's language]
+  • Exit  : [exit condition, in user's language — OMIT this line entirely if no exit condition was specified]
   • Lot   : [lot] | SL: [sl] pip | TP: [tp] pip
 
   (add "⚠️ EA not connected — strategy saved, will apply when EA reconnects." if saved_not_applied)
@@ -1573,6 +1577,28 @@ Assistant: 抱歉，我不支持宏观经济分析。我支持：策略管理（
 
 User (Spanish): ¿Qué opinas del petróleo?
 Assistant: Lo siento, no ofrezco análisis fundamentales. Puedo ayudarte con: gestión de estrategias, órdenes manuales y consultas de datos de mercado en vivo. ¿En qué puedo ayudarte?
+
+### Example F (English — ADD with explicit exit condition)
+User: S3. Buy EURUSD when MA20 crosses above MA50, and close the position when MA20 drops back below MA50.
+Assistant: Confirm add to **S3**?
+• Entry : **BUY EURUSD** when MA20 crosses above MA50
+• Exit  : when MA20 crosses below MA50
+• Lot: 0.10 | SL: 50 pip | TP: 100 pip | TF: auto-detect
+Reply "yes" to confirm.
+
+User: yes
+Assistant: [EXECUTE:{"op":"add","sid":2,"prompt":"Buy EURUSD when MA20 crosses above MA50; close the position when MA20 crosses below MA50","lot":0.10,"sl":50,"tp":100,"tf":0}]
+
+### Example G (Vietnamese — ADD with exit condition)
+User: S1. Mua XAUUSD khi RSI14 dưới 30, đóng lệnh khi RSI14 vượt 70.
+Assistant: Xác nhận thêm vào **S1**?
+• Entry : **BUY XAUUSD** khi RSI(14) < 30
+• Exit  : khi RSI(14) > 70
+• Lot: 0.10 | SL: 50 pip | TP: 100 pip | TF: tự động
+Trả lời "yes" để xác nhận.
+
+User: yes
+Assistant: [EXECUTE:{"op":"add","sid":0,"prompt":"Buy XAUUSD when RSI(14) is below 30; close the position when RSI(14) rises above 70","lot":0.10,"sl":50,"tp":100,"tf":0}]
 """
 
 
@@ -1693,7 +1719,7 @@ async def _handle_chat_http(message: str, user: "User") -> JSONResponse:
                 try:
                     resp2 = await asyncio.wait_for(
                         _claude.messages.create(
-                            model="claude-haiku-4-5-20251001",
+                            model=CLAUDE_CHAT_MODEL,
                             max_tokens=CLAUDE_CHAT_MAX_TOKENS,
                             system=STRATEGY_SYSTEM_PROMPT,
                             messages=inject_msgs,
@@ -1898,7 +1924,6 @@ async def _handle_chat_http(message: str, user: "User") -> JSONResponse:
 
         if crud_result == "parse_error":
             error_code = crud_error or "parse_failed"
-            # Inject into history so Claude explains in the user's language next turn
             _conv_append(user.account_number, "assistant",
                          f"[STRATEGY_ERROR:{error_code}]")
             reply += f"\n\n❌ `strategy_error:{error_code}`"
@@ -1907,10 +1932,17 @@ async def _handle_chat_http(message: str, user: "User") -> JSONResponse:
             _conv_append(user.account_number, "assistant", tag)
             reply += f"\n\n❌ `ea_error:{crud_error}`"
         elif crud_result in ("no_ea", "sent"):
-            reply += _format_strategy_summary(
+            clean_reply = reply  # Claude's text, already stripped of [EXECUTE:]
+            reply = clean_reply + _format_strategy_summary(
                 crud_new_values, sid, op, ea_connected=(crud_result == "sent"),
                 old_values=existing if op == "update" else None,
             )
+            # Update history: replace raw [EXECUTE:...] with clean Claude reply
+            _conv_update_last_assistant(user.account_number, clean_reply)
+            # Inject success tag so Claude knows the outcome on the next turn
+            _ev_tag = (f"[STRATEGY_EVENT:applied:{op}:{sid}]" if crud_result == "sent"
+                       else f"[STRATEGY_EVENT:saved_not_applied:{op}:{sid}]")
+            _conv_append(user.account_number, "assistant", _ev_tag)
 
     logger.info(f"Chat {user.account_number}: {message[:50]}...")
     return {"status": "ok", "reply": reply}
@@ -2288,21 +2320,27 @@ async def _handle_chat_ws(message: str, user: "User") -> str:
 
         if crud_result == "parse_error":
             error_code = crud_error or "parse_failed"
-            # Inject into history so Claude explains in the user's language next turn
             _conv_append(user.account_number, "assistant",
                          f"[STRATEGY_ERROR:{error_code}]")
             reply += f"\n\n❌ `strategy_error:{error_code}`"
         elif crud_result == "error":
+            tag = f"[STRATEGY_EVENT:ea_error:{crud_error}]"
+            _conv_append(user.account_number, "assistant", tag)
             reply += (
                 f"\n\n---\n"
                 f"❌ **EA error:** `{crud_error}`\n"
                 f"Please check the connection and try again."
             )
         elif crud_result in ("no_ea", "sent"):
-            reply += _format_strategy_summary(
+            clean_reply = reply
+            reply = clean_reply + _format_strategy_summary(
                 crud_new_values, sid, op, ea_connected=(crud_result == "sent"),
                 old_values=existing if op == "update" else None,
             )
+            _conv_update_last_assistant(user.account_number, clean_reply)
+            _ev_tag = (f"[STRATEGY_EVENT:applied:{op}:{sid}]" if crud_result == "sent"
+                       else f"[STRATEGY_EVENT:saved_not_applied:{op}:{sid}]")
+            _conv_append(user.account_number, "assistant", _ev_tag)
 
     logger.info(f"Chat {user.account_number}: {message[:50]}...")
     return reply
