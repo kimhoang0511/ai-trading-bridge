@@ -1686,7 +1686,7 @@ async def _handle_chat_http(message: str, user: "User") -> JSONResponse:
     _conv_append(user.account_number, "user",      message)
     _conv_append(user.account_number, "assistant", reply)
 
-    # ── Parse and execute CRUD action if present ─────────────────────────
+    # -── Parse and execute CRUD action if present ─────────────────────────
     action = _extract_execute(reply)
     if action:
         op = action.get("op", "")
