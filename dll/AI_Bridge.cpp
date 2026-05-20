@@ -29,6 +29,7 @@
 #include <thread>
 #include <fstream>
 #include <algorithm>
+#include <functional>
 #include <cmath>
 #include <cstdio>
 
@@ -121,13 +122,14 @@ static JVal ParseJSON(const std::string& s) { size_t p=0; return jparse(s,p); }
 
 // Last-call debug buffer — returned by Bridge_GetLastLog so MT4 can print it
 static std::string g_last_debug;
+static std::mutex  g_debug_mutex; // guards g_last_debug — called from main + WS threads
 
 static void Log(const std::string& msg) {
+    // Write to file (no lock — interleaved lines OK, better than deadlock)
     char ad[MAX_PATH]={};
     ExpandEnvironmentStringsA("%APPDATA%", ad, MAX_PATH);
     std::string dir=std::string(ad)+"\\AI_Bridge";
     CreateDirectoryA(dir.c_str(), nullptr);
-    // Append to rolling log
     HANDLE h=CreateFileA((dir+"\\bridge.log").c_str(), FILE_APPEND_DATA,
                          FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if(h!=INVALID_HANDLE_VALUE){
@@ -138,12 +140,21 @@ static void Log(const std::string& msg) {
         DWORD n; WriteFile(h,line,(DWORD)strlen(line),&n,nullptr);
         CloseHandle(h);
     }
-    // Also accumulate into g_last_debug (reset at start of each Bridge_Init call)
-    g_last_debug += msg + "\n";
+    // Accumulate under lock — WS thread and main thread call Log concurrently
+    try {
+        std::lock_guard<std::mutex> _lk(g_debug_mutex);
+        if (g_last_debug.size() < 512 * 1024)  // cap at 512 KB — prevents unbounded growth
+            g_last_debug += msg + "\n";
+    } catch (...) {}
 }
 
-// Reset debug buffer at start of each Bridge_Init call
-static void LogReset() { g_last_debug.clear(); }
+// Reset debug buffer — called at start of each Bridge_Init / Bridge_Register
+static void LogReset() {
+    try {
+        std::lock_guard<std::mutex> _lk(g_debug_mutex);
+        g_last_debug.clear();
+    } catch (...) {}
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // §3  (removed — api_key.txt no longer needed; Claude is called via backend)
@@ -176,7 +187,7 @@ static bool BackendEnsureHandles() {
     WinHttpSetOption(g_http_hS, WINHTTP_OPTION_SEND_TIMEOUT,       &t30, sizeof(t30));
     WinHttpSetOption(g_http_hS, WINHTTP_OPTION_RECEIVE_TIMEOUT,    &t30, sizeof(t30));
 
-    std::wstring whost(std::string(BACKEND_HOST).begin(), std::string(BACKEND_HOST).end());
+    std::wstring whost(BACKEND_HOST, BACKEND_HOST + strlen(BACKEND_HOST));
     g_http_hC = WinHttpConnect(g_http_hS, whost.c_str(), (INTERNET_PORT)BACKEND_PORT, 0);
     if (!g_http_hC) {
         WinHttpCloseHandle(g_http_hS); g_http_hS = nullptr;
@@ -187,6 +198,7 @@ static bool BackendEnsureHandles() {
 }
 
 static std::string BackendPost(const std::string& path, const std::string& body) {
+    try {
     std::lock_guard<std::mutex> lk(g_http_mtx);
 
     for (int attempt = 0; attempt < 2; ++attempt) {
@@ -214,9 +226,17 @@ static std::string BackendPost(const std::string& path, const std::string& body)
         if (ok && WinHttpReceiveResponse(hR, nullptr)) {
             DWORD av = 0;
             while (WinHttpQueryDataAvailable(hR, &av) && av) {
+                if (av > 4 * 1024 * 1024) {
+                    Log("BackendPost: av=" + std::to_string(av) + " > 4MB, aborting");
+                    break;
+                }
                 std::string chunk(av, '\0'); DWORD got = 0;
                 WinHttpReadData(hR, &chunk[0], av, &got);
-                resp.append(chunk.data(), got);
+                if (got > 0) resp.append(chunk.data(), got);
+                if (resp.size() > 8 * 1024 * 1024) {
+                    Log("BackendPost: resp > 8MB, aborting");
+                    break;
+                }
             }
             WinHttpCloseHandle(hR);
             return resp;
@@ -228,6 +248,13 @@ static std::string BackendPost(const std::string& path, const std::string& body)
             WinHttpCloseHandle(g_http_hC); g_http_hC = nullptr;
             WinHttpCloseHandle(g_http_hS); g_http_hS = nullptr;
         }
+    }
+    } catch (const std::exception& _bpe) {
+        Log("BackendPost EXCEPTION: " + std::string(_bpe.what()));
+        return {};
+    } catch (...) {
+        Log("BackendPost UNKNOWN EXCEPTION");
+        return {};
     }
     return {};
 }
@@ -370,8 +397,18 @@ static bool is_three_black_crows(const V& v){
         &&v.C(1)<v.C(2)&&v.C(0)<v.C(1)&&v.O(1)<v.O(2)&&v.O(0)<v.O(1)
         &&body_ratio(v,2)>0.5&&body_ratio(v,1)>0.5&&body_ratio(v,0)>0.5;
 }
-static bool is_three_inside_up(const V& v)  { return is_bear_harami(v)&&is_bull(v,0)&&v.C(0)>v.O(2); }
-static bool is_three_inside_down(const V& v){ return is_bull_harami(v)&&is_bear(v,0)&&v.C(0)<v.O(2); }
+static bool is_three_inside_up(const V& v) {
+    // bar2: big bear, bar1: small bull inside bar2 body, bar0: bull confirmation
+    bool harami12 = is_bear(v,2)&&is_bull(v,1)
+                 && v.O(1)>v.C(2)&&v.C(1)<v.O(2)&&body(v,1)<body(v,2);
+    return harami12 && is_bull(v,0) && v.C(0)>v.O(2);
+}
+static bool is_three_inside_down(const V& v) {
+    // bar2: big bull, bar1: small bear inside bar2 body, bar0: bear confirmation
+    bool harami12 = is_bull(v,2)&&is_bear(v,1)
+                 && v.O(1)<v.C(2)&&v.C(1)>v.O(2)&&body(v,1)<body(v,2);
+    return harami12 && is_bear(v,0) && v.C(0)<v.O(2);
+}
 
 // Market structure
 static bool is_higher_high(const V& v,int n=3){
@@ -686,6 +723,14 @@ CRITICAL RULES:
 6. tf: minutes (1,5,15,30,60,240,1440); 0 if not specified
 7. sl_pip and tp_pip must be > 0; tp_pip >= sl_pip * 0.5
 8. lot: 0 < lot <= 100
+9. EXIT CONDITIONS — CRITICAL RULES:
+   a. Every indicator name referenced in exit_condition MUST also appear in the "indicators" array.
+      The EA only sends values for indicators listed there — missing names evaluate to 0.0.
+   b. Exit condition indicators MUST use shift=1 (the just-closed bar), NOT shift=0.
+      Checks run at bar OPEN where shift=0 is the new forming bar with only 1 tick — unreliable.
+      Example: exit when RSI crosses 70 → {"name":"rsi14_x","type":"iRSI","period":14,"shift":1}
+              and exit_condition: {"type":"CMP","left":"rsi14_x","op":">=","right":70}
+   c. Use unique names for exit indicators (e.g. suffix "_x") to avoid confusion with entry indicators.
 */
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -824,6 +869,7 @@ Bridge_Init(int sid, const wchar_t* prompt, const wchar_t* symbol,
             const wchar_t* token,
             char* out_buf, int buf_size)
 {
+    try {
     std::lock_guard<std::mutex> lock(g_mutex);
     LogReset();
     // Convert MQL4 wchar_t* strings to std::string
@@ -958,13 +1004,50 @@ Bridge_Init(int sid, const wchar_t* prompt, const wchar_t* symbol,
         FillBuf("{\"status\":\"error\",\"message\":\"Condition dry-run failed\"}",out_buf,buf_size);
         Log("ERROR: condition dry-run FAILED — condition tree may reference unknown variables"); return -1;
     }
+    // 9b. Dry-run exit_condition (non-fatal: warn only so strategy still loads)
+    if (s.exit_condition.get("type") && !DryRunCondition(s.exit_condition, s.ohlc_bars))
+        Log("WARN: exit_condition dry-run failed — check exit indicator names/types");
+
+    // Declare inds here so it's available for both the validator below and ind_json build later
+    auto* inds = cfg.get("indicators");
+
+    // 9c. Validate exit_condition indicators are all declared in indicators array
+    if (s.exit_condition.get("type") && inds && inds->isArr()) {
+        std::vector<std::string> declared;
+        for (auto& ind : inds->a) declared.push_back(ind.str("name"));
+        static const char* builtin[] = {
+            "ask","bid","point","spread","open_","close_","high_","low_","volume_", nullptr
+        };
+        std::function<void(const JVal&)> checkNode = [&](const JVal& node) {
+            if (node.str("type") == "CMP") {
+                for (const char* side : {"left","right"}) {
+                    auto* v = node.get(side);
+                    if (!v || !v->isStr()) continue;
+                    bool known = false;
+                    for (auto& d : declared) if (d == v->s) { known=true; break; }
+                    if (!known) {
+                        for (int bi=0; builtin[bi]; bi++)
+                            if (v->s.rfind(builtin[bi],0)==0) { known=true; break; }
+                    }
+                    if (!known)
+                        Log("WARN exit_condition references undeclared indicator '"
+                            + v->s + "' — add to indicators[] or exit may never fire");
+                }
+            }
+            auto* args = node.get("args");
+            if (args && args->isArr()) for (auto& a : args->a) checkNode(a);
+            auto* arg  = node.get("arg");   if (arg)  checkNode(*arg);
+            auto* s1   = node.get("step1"); if (s1)   checkNode(*s1);
+            auto* s2   = node.get("step2"); if (s2)   checkNode(*s2);
+        };
+        checkNode(s.exit_condition);
+    }
 
     // 10. Store session
     g_sessions[sid]=s;
 
     // Build indicators JSON for EA — include ALL fields so EA handles every type
     std::string ind_json="[]";
-    auto* inds=cfg.get("indicators");
     if(inds&&inds->isArr()&&!inds->a.empty()){
         ind_json="[";
         for(size_t i=0;i<inds->a.size();i++){
@@ -1041,6 +1124,15 @@ Bridge_Init(int sid, const wchar_t* prompt, const wchar_t* symbol,
     WsSend(upd);
 
     return 0;
+    } catch (const std::exception& _ex) {
+        Log(std::string("[init] EXCEPTION: ") + _ex.what());
+        FillBuf("{\"status\":\"error\",\"message\":\"Internal exception in Bridge_Init\"}", out_buf, buf_size);
+        return -1;
+    } catch (...) {
+        Log("[init] UNKNOWN EXCEPTION");
+        FillBuf("{\"status\":\"error\",\"message\":\"Unknown exception in Bridge_Init\"}", out_buf, buf_size);
+        return -1;
+    }
 }
 
 // Maps to: handle_check() + sandbox_run() + validate_output() in Python
@@ -1059,6 +1151,22 @@ Bridge_Check(int sid, const wchar_t* values_json, int account,
     std::string vals_str = W2S(values_json);
     V vals=ParseValues(vals_str.c_str());
 
+    // Build indicator debug string (non-OHLCV named keys only)
+    auto DebugVals = [&]() -> std::string {
+        std::string out;
+        for (auto& kv : vals.d) {
+            const std::string& k = kv.first;
+            if (k.rfind("open_",0)==0 || k.rfind("high_",0)==0 ||
+                k.rfind("low_",0)==0  || k.rfind("close_",0)==0 ||
+                k.rfind("volume_",0)==0) continue;
+            if (!out.empty()) out += ' ';
+            char tmp[64];
+            _snprintf_s(tmp, sizeof(tmp), _TRUNCATE, "%s=%.5f", k.c_str(), kv.second);
+            out += tmp;
+        }
+        return out.empty() ? "(no indicators)" : out;
+    };
+
     // Exit condition evaluated first (higher priority than entry)
     if (s.exit_condition.get("type")) {
         bool should_exit = false;
@@ -1066,7 +1174,11 @@ Bridge_Check(int sid, const wchar_t* values_json, int account,
         catch(const std::exception& e){
             Log(std::string("EvalCond(exit) exception: ")+e.what());
         }
+        Log(std::string("CHECK S")+std::to_string(sid)+" exit_eval="+
+            (should_exit?"true":"false")+" "+DebugVals());
         if (should_exit) {
+            s.seq_exit  = SeqState{};  // reset so SEQ exit doesn't re-fire next bar
+            s.seq_entry = SeqState{};  // reset entry SEQ too — avoid immediate re-entry
             FillBuf("{\"action\":\"EXIT\"}",out_buf,buf_size);
             Log("EXIT signal → "+s.symbol);
             return 0;
@@ -1080,6 +1192,9 @@ Bridge_Check(int sid, const wchar_t* values_json, int account,
         Log(std::string("EvalCond exception: ")+e.what());
         FillBuf("{\"action\":\"NONE\"}",out_buf,buf_size); return 0;
     }
+
+    Log(std::string("CHECK S")+std::to_string(sid)+" entry_eval="+
+        (signal?"true → "+s.action:"false")+" "+DebugVals());
 
     if(!signal){
         FillBuf("{\"action\":\"NONE\"}",out_buf,buf_size); return 0;
@@ -1362,6 +1477,7 @@ static std::string BuildStrategyHello() {
 
 static DWORD WINAPI WsThreadProc(LPVOID) {
     Log("WS: thread started account=" + g_ws_account);
+    try {
     while (g_ws_running) {
         if (!g_ws_hWs) {
             Log("WS: connecting...");
@@ -1403,6 +1519,15 @@ static DWORD WINAPI WsThreadProc(LPVOID) {
         if (btype == WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE && got > 0)
             WsOnMessage(std::string(reinterpret_cast<char*>(buf), got));
     }
+    } catch (const std::exception& _ex) {
+        Log(std::string("WS: EXCEPTION in thread: ") + _ex.what());
+        g_ws_connected = false; g_ws_running = false;
+        if (g_ws_connect_evt) SetEvent(g_ws_connect_evt);
+    } catch (...) {
+        Log("WS: UNKNOWN EXCEPTION in thread");
+        g_ws_connected = false; g_ws_running = false;
+        if (g_ws_connect_evt) SetEvent(g_ws_connect_evt);
+    }
     Log("WS: thread stopped");
     return 0;
 }
@@ -1417,6 +1542,7 @@ __declspec(dllexport) int __stdcall
 Bridge_WsConnect(const wchar_t* account_str, const wchar_t* token,
                  char* out_buf, int buf_size)
 {
+    try {
     // Init state under lock — release before blocking wait
     {
         std::lock_guard<std::mutex> lk(g_ws_connmtx);
@@ -1478,6 +1604,15 @@ Bridge_WsConnect(const wchar_t* account_str, const wchar_t* token,
             JE(last_err).c_str());
         FillBuf(tmp, out_buf, buf_size);
         Log("WS: Bridge_WsConnect → FAILED: " + last_err);
+        return -1;
+    }
+    } catch (const std::exception& _ex) {
+        Log(std::string("[ws] EXCEPTION Bridge_WsConnect: ") + _ex.what());
+        FillBuf("{\"status\":\"error\",\"message\":\"Internal exception in Bridge_WsConnect\"}", out_buf, buf_size);
+        return -1;
+    } catch (...) {
+        Log("[ws] UNKNOWN EXCEPTION Bridge_WsConnect");
+        FillBuf("{\"status\":\"error\",\"message\":\"Unknown exception in Bridge_WsConnect\"}", out_buf, buf_size);
         return -1;
     }
 }
@@ -1543,7 +1678,9 @@ Bridge_WsDisconnect()
     if (g_ws_hC)  { WinHttpCloseHandle(g_ws_hC);  g_ws_hC  = nullptr; }
     if (g_ws_hS)  { WinHttpCloseHandle(g_ws_hS);  g_ws_hS  = nullptr; }
     if (g_ws_thread) {
-        WaitForSingleObject(g_ws_thread, 5000);
+        DWORD _wr = WaitForSingleObject(g_ws_thread, 8000); // 8s > Sleep(5000) in WsDoConnect
+        if (_wr == WAIT_TIMEOUT)
+            Log("WS: Disconnect wait timeout — thread still running");
         CloseHandle(g_ws_thread); g_ws_thread = nullptr;
     }
     Log("WS: Disconnected");
@@ -1567,6 +1704,7 @@ __declspec(dllexport) int __stdcall
 Bridge_Register(int account, const wchar_t* server_broker, int license_type,
                 char* out_buf, int buf_size)
 {
+    try {
     std::lock_guard<std::mutex> lock(g_mutex);
     LogReset();
     Log("=== Bridge_Register account="+std::to_string(account)
@@ -1609,6 +1747,15 @@ Bridge_Register(int account, const wchar_t* server_broker, int license_type,
 
     Log("=== Bridge_Register OK token="+rv.str("token").substr(0,30)+"...");
     return 0;
+    } catch (const std::exception& _ex) {
+        Log(std::string("[reg] EXCEPTION: ") + _ex.what());
+        FillBuf("{\"status\":\"error\",\"message\":\"Internal exception in Bridge_Register\"}", out_buf, buf_size);
+        return -1;
+    } catch (...) {
+        Log("[reg] UNKNOWN EXCEPTION");
+        FillBuf("{\"status\":\"error\",\"message\":\"Unknown exception in Bridge_Register\"}", out_buf, buf_size);
+        return -1;
+    }
 }
 
 // Simple alive-check — call in OnInit to confirm DLL loaded without crashing.

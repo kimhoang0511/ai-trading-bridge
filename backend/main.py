@@ -1149,6 +1149,9 @@ S1 (sid=0) · S2 (sid=1) · S3 (sid=2) · S4 (sid=3) · S5 (sid=4)
               (1) direction: BUY or SELL
               (2) instrument: e.g. EURUSD, XAUUSD, USDJPY
               (3) entry condition: indicator(s) or price-action pattern
+              (4) exit condition (OPTIONAL): indicator-based rule to close the trade
+                  e.g. "close when MA20 crosses below MA50", "exit when RSI > 70"
+                  If omitted, the trade is managed purely by SL/TP.
   - sid    : Target slot S1–S5 (ask if not stated)
   - lot    : Lot size (default 0.10 if not stated)
   - sl     : Stop loss in pips (default 50 if not stated)
@@ -1375,6 +1378,16 @@ This system ONLY supports strategies expressible as:
 - Price action candle patterns (engulfing, hammer, doji, morning/evening star, etc.)
 - Market structure functions (uptrend, downtrend, breakout, consolidation)
 - Combinations of the above with AND/OR/NOT logic
+- **Exit conditions** (exit_condition): the system fully supports indicator-based or pattern-based rules
+  to automatically close an open trade. Examples:
+    · "Close when MA20 crosses below MA50"
+    · "Exit when RSI(14) rises above 70"
+    · "Close position when bearish engulfing appears"
+  Exit conditions use the SAME indicator/pattern vocabulary as entry conditions.
+  They are evaluated bar-by-bar while a trade is open; when the condition fires, the EA
+  closes the position. SL/TP remain active as a safety net alongside exit_condition.
+  When a user asks to close a trade based on a market condition, ALWAYS use exit_condition —
+  do NOT tell them only SL/TP are available.
 
 CANNOT support (decline gracefully in user's language, suggest a supported alternative):
 - News or fundamental-based conditions ("when Fed raises rates", "when NFP is released")
