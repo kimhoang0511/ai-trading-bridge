@@ -1,21 +1,12 @@
 /**
- * file_bridge_main.cpp — AI Bridge standalone GUI (Win32)
+ * file_bridge_mt5.cpp — AI Bridge File IPC server for MT4 + MT5
  *
- * Watches %APPDATA%\MetaQuotes\Terminal\Common\Files\ for ai_bridge_req.json,
- * dispatches using AI_Bridge.cpp logic, writes ai_bridge_resp.json.
+ * Watches Common\Files for ai_bridge_req.json (MT4) and
+ * ai_bridge_req_mt5.json (MT5) using 2 independent worker threads,
+ * dispatches using AI_Bridge.cpp logic protected by a shared mutex,
+ * writes responses to ai_bridge_resp.json / ai_bridge_resp_mt5.json.
  *
- * Build: build_exe.bat  (MSVC x64, no /LD flag)
- *
- * Request format (MT4 writes this file):
- *   {"action":"register","account":12345,"server_broker":"...","license_type":0}
- *   {"action":"init","sid":0,"prompt":"...","symbol":"EURUSD","tf":60,
- *    "lot":0.1,"sl":50,"tp":100,"account":12345,"token":"..."}
- *   {"action":"check","sid":0,"values_json":"{...}","account":12345}
- *   {"action":"stop","sid":0}
- *   {"action":"ws_connect","account":"12345","token":"..."}
- *   {"action":"ws_disconnect"}
- *
- * Response written to ai_bridge_resp.json — same JSON the DLL returns.
+ * Build: build_exe_mt5.bat  (MSVC x64)
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -30,18 +21,18 @@
 #include <string>
 #include <atomic>
 #include <thread>
+#include <mutex>
 #include <fstream>
+#include <queue>
+#include <shlobj.h>
+#pragma comment(lib, "shell32.lib")
 #include "logo_data.h"
 
-#define HEADER_H 55  // height of logo header bar
+#define HEADER_H 55
 
-// Include all logic from AI_Bridge.cpp.
-// DllMain becomes an ordinary function never called in an EXE context.
 #include "AI_Bridge.cpp"
 
-// ── IPC File Encryption ───────────────────────────────────────────────────────
-// XOR stream cipher with 32-byte key + hex encoding.
-// Prefix "ENC:" identifies encrypted payloads; plain-text falls through for compat.
+// ── IPC Encryption (XOR stream + hex, prefix "ENC:") ─────────────────────────
 static const uint8_t IPC_KEY[32] = {
     0x4A,0x1F,0xB3,0x7E,0x9C,0x52,0xD8,0x23,
     0xAE,0x67,0x3B,0xF4,0x81,0x0D,0xC9,0x56,
@@ -96,8 +87,8 @@ static HWND              g_hwnd_stat     = nullptr;
 static HWND              g_hwnd_ea_stat  = nullptr;
 static HWND              g_hwnd_srv_stat = nullptr;
 static std::atomic<bool> g_running       { false };
-static std::thread       g_worker;
-static std::string       g_dir;
+static std::thread       g_thread_read;
+static std::thread       g_thread_write;
 static ULONG_PTR         g_gdiplus_token = 0;
 static Gdiplus::Image*   g_logo_img      = nullptr;
 static HICON             g_icon_big      = nullptr;
@@ -105,9 +96,10 @@ static HICON             g_icon_small    = nullptr;
 
 #define IDI_APPICON 1
 static std::string       g_chat_url;
+static std::mutex        g_chat_url_mutex;
 static HWND              g_hwnd_chat_btn = nullptr;
 static HWND              g_hwnd_qr_btn   = nullptr;
-static bool              g_show_log      = false;  // set false để ẩn log area
+static bool              g_show_log      = true;   // debug: show log area
 static HWND              g_hwnd_qr_dlg   = nullptr;
 static Gdiplus::Image*   g_qr_img        = nullptr;
 static NOTIFYICONDATAA   g_nid           = {};
@@ -139,9 +131,21 @@ static HICON IconFromGdiplus(Gdiplus::Image* img, int size) {
     return hIcon;
 }
 
-// Connection state (updated from worker thread, read on UI thread via WM_UPDATE_STATUS)
-static std::atomic<bool>  g_srv_connected { false };
-static std::atomic<DWORD> g_last_ea_tick  { 0 };     // GetTickCount() of last EA request
+static std::atomic<bool>  g_srv_connected    { false };
+static std::atomic<DWORD> g_last_ea_tick_mt4 { 0 };
+static std::atomic<DWORD> g_last_ea_tick_mt5 { 0 };
+static std::string        g_dir;             // Common\Files\ path
+
+static std::string ResolveCommonDir() {
+    char appdata[MAX_PATH] = {};
+    if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_APPDATA, nullptr, 0, appdata))) {
+        std::string d = std::string(appdata)
+                      + "\\MetaQuotes\\Terminal\\Common\\Files\\";
+        CreateDirectoryA(d.c_str(), nullptr);
+        return d;
+    }
+    return ".\\";
+}
 
 // ── URL encoder ───────────────────────────────────────────────────────────────
 static std::string UrlEncode(const std::string& s) {
@@ -183,7 +187,6 @@ static std::vector<uint8_t> HttpGetBytes(const wchar_t* host, const wchar_t* pat
     return result;
 }
 
-// ── Load Gdiplus::Image from raw bytes in memory ──────────────────────────────
 static Gdiplus::Image* ImageFromBytes(const std::vector<uint8_t>& bytes) {
     if (bytes.empty()) return nullptr;
     HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, bytes.size());
@@ -198,20 +201,17 @@ static Gdiplus::Image* ImageFromBytes(const std::vector<uint8_t>& bytes) {
     return img;
 }
 
-// ── QR dialog window procedure ────────────────────────────────────────────────
+// ── QR dialog ────────────────────────────────────────────────────────────────
 static LRESULT CALLBACK QrWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_QR_READY:
         InvalidateRect(hwnd, nullptr, TRUE);
         return 0;
-
     case WM_PAINT: {
         PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps);
         RECT rc; GetClientRect(hwnd, &rc);
-        // Background
         HBRUSH bg = CreateSolidBrush(RGB(255,255,255));
         FillRect(hdc, &rc, bg); DeleteObject(bg);
-
         if (g_qr_img && g_qr_img->GetLastStatus() == Gdiplus::Ok) {
             Gdiplus::Graphics g(hdc);
             g.SetInterpolationMode(Gdiplus::InterpolationModeNearestNeighbor);
@@ -220,11 +220,12 @@ static LRESULT CALLBACK QrWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetBkMode(hdc, TRANSPARENT);
             SetTextColor(hdc, RGB(100,100,100));
             RECT tr = {20,120,300,160};
-            DrawTextA(hdc, "Đang tải QR...", -1, &tr,
+            DrawTextA(hdc, "Loading QR...", -1, &tr,
                       DT_CENTER | DT_SINGLELINE | DT_VCENTER);
         }
-        // URL text
-        if (!g_chat_url.empty()) {
+        {
+          std::string url_snap; { std::lock_guard<std::mutex> lk(g_chat_url_mutex); url_snap = g_chat_url; }
+          if (!url_snap.empty()) {
             SetBkMode(hdc, TRANSPARENT);
             SetTextColor(hdc, RGB(60, 90, 180));
             HFONT hf = CreateFontA(11,0,0,0,FW_NORMAL,FALSE,TRUE,FALSE,
@@ -232,9 +233,10 @@ static LRESULT CALLBACK QrWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 CLEARTYPE_QUALITY,DEFAULT_PITCH|FF_SWISS,"Segoe UI");
             HFONT ho = (HFONT)SelectObject(hdc, hf);
             RECT ur = {10, 308, 310, 328};
-            DrawTextA(hdc, g_chat_url.c_str(), -1, &ur,
+            DrawTextA(hdc, url_snap.c_str(), -1, &ur,
                       DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
             SelectObject(hdc, ho); DeleteObject(hf);
+          }
         }
         EndPaint(hwnd, &ps);
         return 0;
@@ -248,33 +250,27 @@ static LRESULT CALLBACK QrWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcA(hwnd, msg, wp, lp);
 }
 
-// ── Open / refresh QR dialog ──────────────────────────────────────────────────
 static void ShowQrDialog(HINSTANCE hInst) {
-    if (g_chat_url.empty()) return;
-    // Bring existing dialog to front
+    std::string url;
+    { std::lock_guard<std::mutex> lk(g_chat_url_mutex); url = g_chat_url; }
+    if (url.empty()) return;
     if (g_hwnd_qr_dlg) { SetForegroundWindow(g_hwnd_qr_dlg); return; }
-
-    // Register class once
     static bool registered = false;
     if (!registered) {
         WNDCLASSA wc = {};
         wc.lpfnWndProc   = QrWndProc;
         wc.hInstance     = hInst;
-        wc.lpszClassName = "AIBridgeQR";
+        wc.lpszClassName = "AIBridgeMT5QR";
         wc.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
         wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
         RegisterClassA(&wc);
         registered = true;
     }
-
-    g_hwnd_qr_dlg = CreateWindowA("AIBridgeQR", "QR Code | Scan to Chat",
+    g_hwnd_qr_dlg = CreateWindowA("AIBridgeMT5QR", "QR Code | Scan to Chat",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
         CW_USEDEFAULT, CW_USEDEFAULT, 328, 360,
         g_hwnd, nullptr, hInst, nullptr);
     ShowWindow(g_hwnd_qr_dlg, SW_SHOW);
-
-    // Download QR in background thread
-    std::string url = g_chat_url;
     std::thread([url]() {
         std::string path = "/v1/create-qr-code/?size=280x280&margin=2&data="
                          + UrlEncode(url);
@@ -288,12 +284,6 @@ static void ShowQrDialog(HINSTANCE hInst) {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-static std::string CommonFilesDir() {
-    char buf[MAX_PATH] = {};
-    ExpandEnvironmentStringsA("%APPDATA%", buf, MAX_PATH);
-    return std::string(buf) + "\\MetaQuotes\\Terminal\\Common\\Files\\";
-}
-
 static std::string TimeNow() {
     SYSTEMTIME t; GetLocalTime(&t);
     char s[12];
@@ -329,13 +319,9 @@ static std::string Dispatch(const std::string& json) {
     std::string action = req.str("action");
     char out[65536] = {};
 
-    // Byte-by-byte ASCII→wchar_t (JSON values are always ASCII)
     auto W = [](const std::string& s) -> std::wstring {
         return std::wstring(s.begin(), s.end());
     };
-
-    // Track EA activity on every incoming request
-    g_last_ea_tick = GetTickCount();
 
     if (action == "ping") {
         return "{\"status\":\"ok\",\"pong\":true}";
@@ -345,23 +331,27 @@ static std::string Dispatch(const std::string& json) {
                         W(req.str("server_broker")).c_str(),
                         req.inum("license_type", 0),
                         out, sizeof(out));
-        // Capture token from register response to build chat URL
-        if (g_chat_url.empty()) {
+        {
             JVal rv = ParseJSON(std::string(out));
             std::string tok = rv.str("token");
             if (!tok.empty()) {
-                g_chat_url = "http://aitraiding.up.railway.app/chat?token=" + tok;
-                if (g_hwnd) PostMessage(g_hwnd, WM_TOKEN_READY, 0, 0);
+                std::lock_guard<std::mutex> lk(g_chat_url_mutex);
+                if (g_chat_url.empty()) {
+                    g_chat_url = "http://aitraiding.up.railway.app/chat?token=" + tok;
+                    if (g_hwnd) PostMessage(g_hwnd, WM_TOKEN_READY, 0, 0);
+                }
             }
         }
     }
     else if (action == "init") {
-        // Capture token from EA request (always present in init)
-        if (g_chat_url.empty()) {
+        {
             std::string tok = req.str("token");
             if (!tok.empty()) {
-                g_chat_url = "http://aitraiding.up.railway.app/chat?token=" + tok;
-                if (g_hwnd) PostMessage(g_hwnd, WM_TOKEN_READY, 0, 0);
+                std::lock_guard<std::mutex> lk(g_chat_url_mutex);
+                if (g_chat_url.empty()) {
+                    g_chat_url = "http://aitraiding.up.railway.app/chat?token=" + tok;
+                    if (g_hwnd) PostMessage(g_hwnd, WM_TOKEN_READY, 0, 0);
+                }
             }
         }
         Bridge_Init(req.inum("sid"),
@@ -387,7 +377,6 @@ static std::string Dispatch(const std::string& json) {
         Bridge_WsConnect(W(req.str("account")).c_str(),
                          W(req.str("token")).c_str(),
                          out, sizeof(out));
-        // Mark connected if response is ok
         std::string r(out);
         g_srv_connected = (r.find("\"status\":\"ok\"") != std::string::npos ||
                           r.find("\"connected\":true") != std::string::npos);
@@ -404,7 +393,9 @@ static std::string Dispatch(const std::string& json) {
         return std::string(out);
     }
     else if (action == "ws_send") {
-        Bridge_WsSend(W(req.str("msg")).c_str());
+        std::string msg = req.str("msg");
+        UILog("[DBG ws_send] " + msg.substr(0, 200));
+        Bridge_WsSend(W(msg).c_str());
         return "{\"status\":\"ok\"}";
     }
     else {
@@ -415,67 +406,121 @@ static std::string Dispatch(const std::string& json) {
     return std::string(out);
 }
 
-// ── Worker thread ─────────────────────────────────────────────────────────────
-static void Worker() {
-    UILog("Started. Watching: " + g_dir);
+// ── File IPC — Producer / Consumer ───────────────────────────────────────────
+//
+//  Read Thread  : polls file system, reads req files, pushes to g_req_queue
+//  Write Thread : pops from queue, dispatches (mutex), writes resp file
+//
+struct ReqItem {
+    std::string content;   // decrypted JSON
+    std::string resp_path; // where to write the response
+    std::string tag;       // "[MT4]" or "[MT5]"
+    std::atomic<DWORD>* last_tick;
+};
 
-    const std::string req_path  = g_dir + "ai_bridge_req.json";
-    const std::string resp_path = g_dir + "ai_bridge_resp.json";
+static std::mutex              g_dispatch_mutex;
+static std::mutex              g_queue_mutex;
+static std::condition_variable g_queue_cv;
+static std::queue<ReqItem>     g_req_queue;
 
-    DWORD last_status_tick = 0;
+// Read thread — watches MT4 fixed file + MT5 wildcard ai_bridge_req_mt5_*.json.
+// Each MT5 EA instance uses a unique filename (ChartID suffix) so multiple
+// charts running the same EA don't collide.
+static void ReadThread(const std::string& mt4_req)
+{
+    UILog("[Read] thread started.");
+    const std::string mt5_req_prefix  = "ai_bridge_req_mt5_";
+    const std::string mt5_resp_prefix = "ai_bridge_resp_mt5_";
 
     while (g_running) {
-        if (GetFileAttributesA(req_path.c_str()) != INVALID_FILE_ATTRIBUTES) {
-            Sleep(20); // let MT4 finish writing
-
-            std::string content;
-            {
-                std::ifstream f(req_path);
-                if (f) content.assign(std::istreambuf_iterator<char>(f), {});
-            }
-            if (!content.empty()) {
-                DeleteFileA(req_path.c_str());
-                content = IpcDecrypt(content);
-
-                // Skip logging ws_poll noise but show meaningful WS events
-                bool is_poll = (content.find("\"ws_poll\"") != std::string::npos);
-                if (!is_poll) UILog(">> " + content.substr(0, 120));
-
-                std::string resp = Dispatch(content);
-
-                if (!is_poll) {
-                    UILog("<< " + resp.substr(0, 120));
-                } else {
-                    // Log ws_poll responses that carry a real event (not none/ping/pong)
-                    bool is_noise = (resp.find("\"event\":\"none\"")  != std::string::npos ||
-                                     resp.find("\"event\":\"ping\"")  != std::string::npos ||
-                                     resp.find("\"event\":\"pong\"")  != std::string::npos ||
-                                     resp.find("\"event\":\"connected\"") != std::string::npos);
-                    if (!is_noise) UILog("[WS] " + resp.substr(0, 200));
-                }
-
-                std::ofstream rf(resp_path, std::ios::trunc);
-                if (rf) rf << IpcEncrypt(resp);
+        // ── MT4: single fixed file ─────────────────────────────────────────
+        if (GetFileAttributesA(mt4_req.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            Sleep(20);
+            std::string raw;
+            { std::ifstream f(mt4_req); if (f) raw.assign(std::istreambuf_iterator<char>(f), {}); }
+            if (!raw.empty()) {
+                DeleteFileA(mt4_req.c_str());
+                ReqItem item{ IpcDecrypt(raw),
+                              g_dir + "ai_bridge_resp.json",
+                              "[MT4]", &g_last_ea_tick_mt4 };
+                std::lock_guard<std::mutex> lk(g_queue_mutex);
+                g_req_queue.push(std::move(item));
+                g_queue_cv.notify_one();
             }
         }
 
-        // Update status panel every second
-        DWORD now = GetTickCount();
-        if (now - last_status_tick >= 1000) {
-            last_status_tick = now;
-            PostStatusUpdate();
+        // ── MT5: scan ai_bridge_req_mt5_*.json (one file per EA instance) ──
+        {
+            WIN32_FIND_DATAA ffd = {};
+            HANDLE hFind = FindFirstFileA((g_dir + mt5_req_prefix + "*.json").c_str(), &ffd);
+            if (hFind != INVALID_HANDLE_VALUE) {
+                do {
+                    std::string req_path  = g_dir + ffd.cFileName;
+                    // "ai_bridge_req_mt5_12345.json" → suffix = "12345.json"
+                    std::string suffix    = std::string(ffd.cFileName).substr(mt5_req_prefix.size());
+                    std::string resp_path = g_dir + mt5_resp_prefix + suffix;
+
+                    Sleep(20);
+                    std::string raw;
+                    { std::ifstream f(req_path); if (f) raw.assign(std::istreambuf_iterator<char>(f), {}); }
+                    if (!raw.empty()) {
+                        DeleteFileA(req_path.c_str());
+                        ReqItem item{ IpcDecrypt(raw), resp_path, "[MT5]", &g_last_ea_tick_mt5 };
+                        std::lock_guard<std::mutex> lk(g_queue_mutex);
+                        g_req_queue.push(std::move(item));
+                        g_queue_cv.notify_one();
+                    }
+                } while (FindNextFileA(hFind, &ffd));
+                FindClose(hFind);
+            }
         }
 
         Sleep(50);
     }
+    g_queue_cv.notify_all(); // wake write thread to exit
+    UILog("[Read] thread stopped.");
+}
 
-    g_srv_connected = false;
-    g_last_ea_tick = 0;
-    PostStatusUpdate();
+// Write thread — pops from queue, dispatches, writes response file.
+static void WriteThread()
+{
+    UILog("[Write] thread started.");
+    while (true) {
+        ReqItem item;
+        {
+            std::unique_lock<std::mutex> lk(g_queue_mutex);
+            g_queue_cv.wait(lk, []{ return !g_req_queue.empty() || !g_running; });
+            if (g_req_queue.empty()) break; // g_running == false and queue empty
+            item = std::move(g_req_queue.front());
+            g_req_queue.pop();
+        }
 
-    UILog("Stopped.");
-    // Re-enable Start button from worker thread via message
-    PostMessage(g_hwnd, WM_COMMAND, MAKEWPARAM(0, 0xFFFF), 0);
+        bool is_poll = (item.content.find("\"ws_poll\"") != std::string::npos);
+        if (!is_poll) UILog(item.tag + " >> " + item.content.substr(0, 120));
+
+        std::string resp;
+        {
+            std::lock_guard<std::mutex> lk(g_dispatch_mutex);
+            resp = Dispatch(item.content);
+        }
+
+        *item.last_tick = GetTickCount();
+        PostStatusUpdate();
+
+        if (!is_poll) {
+            UILog(item.tag + " << " + resp.substr(0, 120));
+        } else {
+            bool is_noise = (resp.find("\"event\":\"none\"")      != std::string::npos ||
+                             resp.find("\"event\":\"ping\"")      != std::string::npos ||
+                             resp.find("\"event\":\"pong\"")      != std::string::npos ||
+                             resp.find("\"event\":\"connected\"") != std::string::npos);
+            if (!is_noise) UILog(item.tag + " [WS] " + resp.substr(0, 200));
+        }
+
+        std::ofstream rf(item.resp_path, std::ios::trunc);
+        if (rf) rf << IpcEncrypt(resp);
+    }
+    UILog("[Write] thread stopped.");
 }
 
 // ── Window procedure ──────────────────────────────────────────────────────────
@@ -483,27 +528,22 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
 
     case WM_CREATE: {
-        // Row 1: app status (shifted down by HEADER_H)
         g_hwnd_stat = CreateWindowA("STATIC", "Status: Stopped",
             WS_CHILD | WS_VISIBLE | SS_LEFT,
             10, HEADER_H+12, 200, 20, hwnd, nullptr, nullptr, nullptr);
 
-        // Row 1: EA status indicator
         g_hwnd_ea_stat = CreateWindowA("STATIC", "EA: --",
             WS_CHILD | WS_VISIBLE | SS_LEFT,
             220, HEADER_H+12, 180, 20, hwnd, nullptr, nullptr, nullptr);
 
-        // Row 1: Server status indicator
         g_hwnd_srv_stat = CreateWindowA("STATIC", "Server: --",
             WS_CHILD | WS_VISIBLE | SS_LEFT,
             410, HEADER_H+12, 210, 20, hwnd, nullptr, nullptr, nullptr);
 
-        // Separator
         CreateWindowA("STATIC", "",
             WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ,
             10, HEADER_H+36, 610, 2, hwnd, nullptr, nullptr, nullptr);
 
-        // Buttons
         g_hwnd_start = CreateWindowA("BUTTON", "Start",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
             10, HEADER_H+44, 100, 30, hwnd, (HMENU)IDC_BTN_START, nullptr, nullptr);
@@ -525,7 +565,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_DISABLED,
             475, HEADER_H+44, 120, 30, hwnd, (HMENU)IDC_BTN_QR, nullptr, nullptr);
 
-        // Log area
         g_hwnd_log = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", "",
             WS_CHILD | (g_show_log ? WS_VISIBLE : 0) | WS_VSCROLL |
             ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
@@ -540,29 +579,25 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_ERASEBKGND:
-        return 1;  // suppress default erase — WM_PAINT fills everything
+        return 1;
 
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hwnd, &ps);
 
-        // ── Double buffer: draw to memory DC then BitBlt in one shot ──
         RECT cli; GetClientRect(hwnd, &cli);
         HDC     memDC  = CreateCompatibleDC(hdc);
         HBITMAP memBmp = CreateCompatibleBitmap(hdc, cli.right, cli.bottom);
         HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, memBmp);
 
-        // Client background (below header)
         HBRUSH hBgBr = GetSysColorBrush(COLOR_BTNFACE);
         FillRect(memDC, &cli, hBgBr);
 
-        // Header background
         RECT hdr = { 0, 0, cli.right, HEADER_H };
         HBRUSH hbr = CreateSolidBrush(RGB(20, 24, 40));
         FillRect(memDC, &hdr, hbr);
         DeleteObject(hbr);
 
-        // Bottom edge of header
         HPEN hpen = CreatePen(PS_SOLID, 1, RGB(60, 70, 120));
         HPEN hOldPen = (HPEN)SelectObject(memDC, hpen);
         MoveToEx(memDC, 0, HEADER_H - 1, nullptr);
@@ -570,7 +605,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SelectObject(memDC, hOldPen);
         DeleteObject(hpen);
 
-        // Logo
         if (g_logo_img && g_logo_img->GetLastStatus() == Gdiplus::Ok) {
             Gdiplus::Graphics g(memDC);
             g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
@@ -578,7 +612,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g.DrawImage(g_logo_img, 10, 7, 40, 40);
         }
 
-        // Title
         SetBkMode(memDC, TRANSPARENT);
         SetTextColor(memDC, RGB(220, 225, 255));
         HFONT hTitle = CreateFontA(17, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
@@ -586,26 +619,27 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
         HFONT hOldFont = (HFONT)SelectObject(memDC, hTitle);
         RECT tr = { 58, 9, 640, 32 };
-        DrawTextA(memDC, "AI Chat Bot Trade Builder (MT4 version)", -1, &tr, DT_LEFT | DT_SINGLELINE);
+        DrawTextA(memDC, "AI Chat Bot Trade Builder", -1, &tr, DT_LEFT | DT_SINGLELINE);
 
-        // Subtitle
         SetTextColor(memDC, RGB(120, 130, 180));
         HFONT hSub = CreateFontA(12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
         SelectObject(memDC, hSub);
         RECT sr = { 58, 32, 640, 50 };
-        DrawTextA(memDC, "MT4 File IPC Bridge", -1, &sr, DT_LEFT | DT_SINGLELINE);
+        DrawTextA(memDC, "MT4 + MT5 File IPC Bridge", -1, &sr, DT_LEFT | DT_SINGLELINE);
 
         SelectObject(memDC, hOldFont);
         DeleteObject(hTitle);
         DeleteObject(hSub);
 
-        // Status dot in header top-right
         {
             bool running = g_running.load();
-            bool ea_ok   = running && (g_last_ea_tick.load() > 0 &&
-                           GetTickCount() - g_last_ea_tick.load() < 5000);
+            DWORD now_t  = GetTickCount();
+            bool ea_ok   = running && ((g_last_ea_tick_mt4.load() > 0 &&
+                                        now_t - g_last_ea_tick_mt4.load() < 5000) ||
+                                       (g_last_ea_tick_mt5.load() > 0 &&
+                                        now_t - g_last_ea_tick_mt5.load() < 5000));
             bool srv_ok  = running && g_srv_connected.load();
 
             COLORREF dot_clr;
@@ -642,7 +676,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             DeleteObject(hDotFont);
         }
 
-        // Flush memory DC to screen in one atomic blit
         BitBlt(hdc, 0, 0, cli.right, cli.bottom, memDC, 0, 0, SRCCOPY);
         SelectObject(memDC, oldBmp);
         DeleteObject(memBmp);
@@ -654,23 +687,24 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_UPDATE_STATUS: {
         if (!g_running) {
-            SetWindowTextA(g_hwnd_ea_stat,  "EA: --");
-            SetWindowTextA(g_hwnd_srv_stat, "Server: --");
+            SetWindowTextA(g_hwnd_ea_stat,  "MT4: --");
+            SetWindowTextA(g_hwnd_srv_stat, "MT5: --");
             g_ea_was_connected = false;
         } else {
-            DWORD last = g_last_ea_tick.load();
-            bool ea_ok = (last > 0 && GetTickCount() - last < 5000);
-            SetWindowTextA(g_hwnd_ea_stat, ea_ok ? "EA: Connected" : "EA: No signal");
+            DWORD now = GetTickCount();
+            bool mt4_ok = (g_last_ea_tick_mt4.load() > 0 &&
+                           now - g_last_ea_tick_mt4.load() < 5000);
+            bool mt5_ok = (g_last_ea_tick_mt5.load() > 0 &&
+                           now - g_last_ea_tick_mt5.load() < 5000);
+            SetWindowTextA(g_hwnd_ea_stat,  mt4_ok ? "MT4: Connected" : "MT4: No signal");
+            SetWindowTextA(g_hwnd_srv_stat, mt5_ok ? "MT5: Connected" : "MT5: No signal");
 
-            if (g_ea_was_connected && !ea_ok)
+            bool any_ok = mt4_ok || mt5_ok;
+            if (g_ea_was_connected && !any_ok)
                 ShowTrayNotification("AI Bridge | EA Disconnected",
-                    "Connection to MT4 EA lost.\nPlease restart the EA in MetaTrader 4.");
-            g_ea_was_connected = ea_ok;
-
-            bool srv_ok = g_srv_connected.load();
-            SetWindowTextA(g_hwnd_srv_stat, srv_ok ? "Server: Connected" : "Server: Disconnected");
+                    "Both MT4 and MT5 EAs lost connection.");
+            g_ea_was_connected = any_ok;
         }
-        // Repaint header to update status dot + colored labels
         RECT hdr = { 0, 0, 650, HEADER_H };
         InvalidateRect(hwnd, &hdr, FALSE);
         return 0;
@@ -684,9 +718,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_COMMAND: {
         WORD id = LOWORD(wp);
 
-        if (id == IDC_BTN_CHAT && !g_chat_url.empty()) {
-            ShellExecuteA(nullptr, "open", g_chat_url.c_str(),
-                          nullptr, nullptr, SW_SHOWNORMAL);
+        if (id == IDC_BTN_CHAT) {
+            std::string url; { std::lock_guard<std::mutex> lk(g_chat_url_mutex); url = g_chat_url; }
+            if (!url.empty()) ShellExecuteA(nullptr, "open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
             return 0;
         }
         if (id == IDC_BTN_QR) {
@@ -695,7 +729,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
 
-        // Worker thread done signal (id=0, notify=0xFFFF)
         if (id == 0 && HIWORD(wp) == 0xFFFF) {
             EnableWindow(g_hwnd_start, TRUE);
             EnableWindow(g_hwnd_stop,  FALSE);
@@ -704,24 +737,33 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
 
         if (id == IDC_BTN_START && !g_running) {
-            g_dir = CommonFilesDir();
-            CreateDirectoryA(g_dir.c_str(), nullptr);
-            g_running = true;
-            g_worker  = std::thread(Worker);
+            if (g_dir.empty()) g_dir = ResolveCommonDir();
+            g_running          = true;
+            g_last_ea_tick_mt4 = 0;
+            g_last_ea_tick_mt5 = 0;
+            { std::lock_guard<std::mutex> lk(g_queue_mutex);
+              while (!g_req_queue.empty()) g_req_queue.pop(); }
+            g_thread_read  = std::thread(ReadThread,
+                g_dir + "ai_bridge_req.json");
+            g_thread_write = std::thread(WriteThread);
             EnableWindow(g_hwnd_start, FALSE);
             EnableWindow(g_hwnd_stop,  TRUE);
             SetWindowTextA(g_hwnd_stat, "Status: Running");
+            UILog("Watching: " + g_dir);
             InvalidateRect(hwnd, nullptr, FALSE);
         }
         else if (id == IDC_BTN_STOP && g_running) {
             SetWindowTextA(g_hwnd_stat, "Status: Stopping...");
             EnableWindow(g_hwnd_stop, FALSE);
             g_running = false;
+            g_queue_cv.notify_all();
             Bridge_WsDisconnect();
-            if (g_worker.joinable()) g_worker.join();
+            if (g_thread_read.joinable())  g_thread_read.join();
+            if (g_thread_write.joinable()) g_thread_write.join();
             EnableWindow(g_hwnd_start, TRUE);
             SetWindowTextA(g_hwnd_stat, "Status: Stopped");
             InvalidateRect(hwnd, nullptr, FALSE);
+            PostMessage(hwnd, WM_COMMAND, MAKEWPARAM(0, 0xFFFF), 0);
         }
         else if (id == IDC_BTN_CLEAR) {
             SetWindowTextA(g_hwnd_log, "");
@@ -750,7 +792,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         GetWindowTextA(hCtrl, buf, sizeof(buf));
         std::string txt(buf);
 
-        COLORREF clr = RGB(160, 160, 160); // default gray
+        COLORREF clr = RGB(160, 160, 160);
         if (hCtrl == g_hwnd_stat) {
             if (txt.find("Running")  != std::string::npos) clr = RGB(50,  210, 90);
             if (txt.find("Stopping") != std::string::npos) clr = RGB(240, 160, 30);
@@ -779,8 +821,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DESTROY:
         if (g_tray_added) { Shell_NotifyIconA(NIM_DELETE, &g_nid); g_tray_added = false; }
         g_running = false;
+        g_queue_cv.notify_all();
         Bridge_WsDisconnect();
-        if (g_worker.joinable()) g_worker.detach();
+        if (g_thread_read.joinable())  g_thread_read.detach();
+        if (g_thread_write.joinable()) g_thread_write.detach();
         g_hwnd = nullptr;
         PostQuitMessage(0);
         return 0;
@@ -790,15 +834,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 // ── WinMain ───────────────────────────────────────────────────────────────────
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nShow) {
-    // Init GDI+
     Gdiplus::GdiplusStartupInput gdipInput;
     Gdiplus::GdiplusStartup(&g_gdiplus_token, &gdipInput, nullptr);
     LoadLogo();
 
-    // Create HICON from embedded PNG (runtime icon for title bar + taskbar)
     g_icon_big   = IconFromGdiplus(g_logo_img, 32);
     g_icon_small = IconFromGdiplus(g_logo_img, 16);
-    // Prefer embedded .ico resource (set via rc); fall back to runtime icon
     HICON hIconRes = LoadIconA(hInst, MAKEINTRESOURCEA(IDI_APPICON));
     if (!hIconRes) hIconRes = g_icon_big;
 
@@ -806,35 +847,32 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nShow) {
     wc.cbSize        = sizeof(WNDCLASSEXA);
     wc.lpfnWndProc   = WndProc;
     wc.hInstance     = hInst;
-    wc.lpszClassName = "AIBridgeProxy";
+    wc.lpszClassName = "AIBridgeMT5Proxy";
     wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     wc.hIcon         = hIconRes;
     wc.hIconSm       = g_icon_small;
     RegisterClassExA(&wc);
 
-    // Height: full (with log) or compact (log hidden)
     int win_h = g_show_log ? (502 + HEADER_H) : (HEADER_H + 130);
-    g_hwnd = CreateWindowA("AIBridgeProxy", "AI Chat Bot Trade Builder (MT4 version)",
+    g_hwnd = CreateWindowA("AIBridgeMT5Proxy", "AI Chat Bot Trade Builder (MT5)",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         CW_USEDEFAULT, CW_USEDEFAULT, 648, win_h,
         nullptr, nullptr, hInst, nullptr);
 
-    // Set icon on window (title bar + taskbar)
     SendMessage(g_hwnd, WM_SETICON, ICON_BIG,   (LPARAM)(hIconRes ? hIconRes : g_icon_big));
     SendMessage(g_hwnd, WM_SETICON, ICON_SMALL,  (LPARAM)g_icon_small);
 
     ShowWindow(g_hwnd, nShow);
     UpdateWindow(g_hwnd);
 
-    // Add system tray icon (required for balloon notifications)
     g_nid.cbSize           = sizeof(NOTIFYICONDATAA);
     g_nid.hWnd             = g_hwnd;
     g_nid.uID              = 1;
     g_nid.uFlags           = NIF_ICON | NIF_TIP | NIF_MESSAGE;
     g_nid.uCallbackMessage = WM_TRAY_ICON;
     g_nid.hIcon            = g_icon_small ? g_icon_small : LoadIconA(nullptr, IDI_APPLICATION);
-    strncpy_s(g_nid.szTip, sizeof(g_nid.szTip), "AI Chat Bot Trade Builder", _TRUNCATE);
+    strncpy_s(g_nid.szTip, sizeof(g_nid.szTip), "AI Chat Bot Trade Builder (MT5)", _TRUNCATE);
     g_tray_added = (Shell_NotifyIconA(NIM_ADD, &g_nid) == TRUE);
 
     MSG m = {};
@@ -843,7 +881,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nShow) {
         DispatchMessage(&m);
     }
 
-    // Cleanup
     delete g_logo_img;
     if (g_icon_big)   DestroyIcon(g_icon_big);
     if (g_icon_small) DestroyIcon(g_icon_small);

@@ -464,6 +464,28 @@ int OnInit()
    g_init_hard_failed = false;
    EventSetTimer(1);
 
+   // Strategy Tester: kích hoạt built-in MA20/MA50 tự động — bridge không có trong tester
+   if ((bool)MQLInfoInteger(MQL_TESTER)) {
+      g_slots[0].active        = true;
+      g_slots[0].enabled       = true;
+      g_slots[0].prompt        = "MA20/MA50 crossover (tester mode)";
+      g_slots[0].symbol        = Symbol();
+      g_slots[0].tf            = Period();
+      g_slots[0].lot           = S1_Default_Lot > 0 ? S1_Default_Lot : 0.01;
+      g_slots[0].sl            = S1_Default_SL  > 0 ? S1_Default_SL  : 50;
+      g_slots[0].tp            = S1_Default_TP  > 0 ? S1_Default_TP  : 100;
+      g_slots[0].last_bar      = 0;
+      g_slots[0].last_draw_bar = 0;
+      g_slots[0].ind_count     = 0;
+      g_slots[0].ohlc_bars     = 5;
+      g_slots[0].action        = "BUY/SELL";
+      g_slots[0].chart_id      = ChartID();
+      g_slots[0].chart_open_ms = 0; // không warmup delay trong tester
+      g_active                 = 1;
+      g_s1_builtin_mode        = true;
+      return INIT_SUCCEEDED;
+   }
+
    // Kích hoạt built-in trading cho S1 ngay lập tức nếu được bật
    if (S1_Enable && StringLen(S1_Prompt) > 0) {
       g_slots[0].active        = true;
